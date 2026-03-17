@@ -1665,9 +1665,13 @@ FilterParser.prototype.parseOptions = function(s) {
         if ( opt.startsWith('header=') ) {
             continue;
         }
-        // $ipaddress= : IP-based filtering. Skip for now.
+        // $ipaddress= : IP-based filtering. Cannot implement on UXP.
+        // MUST reject (not skip) because skipping removes a critical restriction
+        // that narrows broad rules like ||com^$doc,ipaddress=x.x.x.x to specific IPs.
+        // Without the IP check, such rules would block ALL .com sites.
         if ( opt.startsWith('ipaddress=') ) {
-            continue;
+            this.unsupported = true;
+            break;
         }
         // $reason= : filter annotation (informational only, no filtering effect).
         if ( opt.startsWith('reason=') || (opt.startsWith('reason') && opt.indexOf('"') !== -1) ) {
