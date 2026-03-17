@@ -1695,6 +1695,172 @@ window.addEventListener('beforeunload', releaseView);
 
 /******************************************************************************/
 
+/******************************************************************************/
+// Enhanced Logger Features
+/******************************************************************************/
+
+// ── Pause/Resume logging ──
+
+var logPaused = false;
+
+var togglePauseLog = function() {
+    logPaused = !logPaused;
+    var btn = document.getElementById('pauseLog');
+    if ( logPaused ) {
+        btn.classList.add('paused');
+        btn.textContent = '\uf04b'; // play icon
+        btn.title = 'Resume logging';
+    } else {
+        btn.classList.remove('paused');
+        btn.textContent = '\uf04c'; // pause icon
+        btn.title = 'Pause logging';
+    }
+};
+
+// Wrap the existing readLogBuffer to respect pause
+var _origReadLogBuffer = readLogBuffer;
+readLogBuffer = function() {
+    if ( logPaused ) {
+        vAPI.setTimeout(readLogBuffer, 1200);
+        return;
+    }
+    _origReadLogBuffer();
+};
+
+// ── Preset filter buttons ──
+
+var activePreset = '';
+
+var applyPresetFilter = function(ev) {
+    var btn = ev.target;
+    var preset = btn.id;
+    var filterInput = document.getElementById('filterInput');
+
+    // Toggle off if already active
+    if ( activePreset === preset ) {
+        activePreset = '';
+        btn.classList.remove('active');
+        filterInput.value = '';
+        filterInput.dispatchEvent(new Event('input'));
+        return;
+    }
+
+    // Clear previous active
+    var prev = document.querySelector('.preset-btn.active');
+    if ( prev ) { prev.classList.remove('active'); }
+
+    activePreset = preset;
+    btn.classList.add('active');
+
+    // Set the filter input based on preset
+    switch ( preset ) {
+    case 'filterBlocked':
+        filterInput.value = '|--';
+        break;
+    case 'filterAllowed':
+        filterInput.value = '|++';
+        break;
+    case 'filter3p':
+        filterInput.value = '|3p';
+        break;
+    case 'filterErrors':
+        filterInput.value = 'error';
+        break;
+    default:
+        filterInput.value = '';
+        break;
+    }
+    filterInput.dispatchEvent(new Event('input'));
+};
+
+// ── Export visible log entries ──
+
+var exportLog = function() {
+    var tbody = document.querySelector('#netInspector tbody');
+    if ( !tbody ) { return; }
+
+    var lines = [];
+    var rows = tbody.querySelectorAll('tr:not(.f):not(.maindoc)');
+    for ( var i = 0; i < rows.length; i++ ) {
+        var cells = rows[i].querySelectorAll('td');
+        var parts = [];
+        for ( var j = 0; j < cells.length; j++ ) {
+            var text = cells[j].textContent.trim();
+            if ( text ) { parts.push(text); }
+        }
+        if ( parts.length > 0 ) {
+            lines.push(parts.join('\t'));
+        }
+    }
+
+    if ( lines.length === 0 ) {
+        showToast('No visible entries to export');
+        return;
+    }
+
+    // Copy to clipboard
+    var textArea = document.createElement('textarea');
+    textArea.value = lines.join('\n');
+    textArea.style.position = 'fixed';
+    textArea.style.left = '-9999px';
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+        document.execCommand('copy');
+        showToast(lines.length + ' entries copied to clipboard');
+    } catch(e) {
+        showToast('Export failed: ' + e.message);
+    }
+    document.body.removeChild(textArea);
+};
+
+var showToast = function(msg) {
+    var toast = document.createElement('div');
+    toast.className = 'export-toast';
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    setTimeout(function() {
+        toast.remove();
+    }, 2000);
+};
+
+// ── Keyboard shortcuts ──
+
+document.addEventListener('keydown', function(ev) {
+    // Ctrl+F: focus filter input
+    if ( ev.ctrlKey && ev.key === 'f' ) {
+        ev.preventDefault();
+        document.getElementById('filterInput').focus();
+        return;
+    }
+    // Ctrl+E: export log
+    if ( ev.ctrlKey && ev.key === 'e' ) {
+        ev.preventDefault();
+        exportLog();
+        return;
+    }
+    // Space (when not in input): toggle pause
+    if ( ev.key === ' ' && ev.target.tagName !== 'INPUT' && ev.target.tagName !== 'TEXTAREA' && ev.target.tagName !== 'SELECT' ) {
+        ev.preventDefault();
+        togglePauseLog();
+        return;
+    }
+    // Escape: clear filter
+    if ( ev.key === 'Escape' ) {
+        var filterInput = document.getElementById('filterInput');
+        if ( filterInput.value !== '' ) {
+            filterInput.value = '';
+            filterInput.dispatchEvent(new Event('input'));
+            var prev = document.querySelector('.preset-btn.active');
+            if ( prev ) { prev.classList.remove('active'); }
+            activePreset = '';
+        }
+        return;
+    }
+});
+
+/******************************************************************************/
+
 readLogBuffer();
 
 uDom('#pageSelector').on('change', pageSelectorChanged);
@@ -1709,6 +1875,14 @@ uDom('#netInspector table').on('click', 'tr > td:nth-of-type(1)', toggleVCompact
 uDom('#netInspector table').on('click', 'tr.canMtx > td:nth-of-type(2)', popupManager.toggleOn);
 uDom('#netInspector').on('click', 'tr.canLookup > td:nth-of-type(3)', reverseLookupManager.toggleOn);
 uDom('#netInspector').on('click', 'tr.cat_net > td:nth-of-type(4)', netFilteringManager.toggleOn);
+
+// Enhanced logger event handlers
+uDom('#pauseLog').on('click', togglePauseLog);
+uDom('#exportLog').on('click', exportLog);
+uDom('#filterBlocked').on('click', applyPresetFilter);
+uDom('#filterAllowed').on('click', applyPresetFilter);
+uDom('#filter3p').on('click', applyPresetFilter);
+uDom('#filterErrors').on('click', applyPresetFilter);
 
 window.addEventListener('hashchange', pageSelectorFromURLHash);
 
