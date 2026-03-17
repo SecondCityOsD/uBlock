@@ -1727,6 +1727,22 @@ readLogBuffer = function() {
     _origReadLogBuffer();
 };
 
+// ── Filter expression picker dropdown toggle ──
+
+var toggleFilterDropdown = function() {
+    var picker = document.getElementById('filterExprPicker');
+    picker.classList.toggle('hide');
+};
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(ev) {
+    var picker = document.getElementById('filterExprPicker');
+    var toggle = document.getElementById('filterExprPickerToggle');
+    if ( picker.classList.contains('hide') ) { return; }
+    if ( picker.contains(ev.target) || ev.target === toggle ) { return; }
+    picker.classList.add('hide');
+});
+
 // ── Preset filter pills (expression picker) ──
 
 var applyPresetFilter = function(ev) {
@@ -1856,6 +1872,7 @@ uDom('#netInspector').on('click', 'tr.cat_net > td:nth-of-type(4)', netFiltering
 // Enhanced logger event handlers
 uDom('#pauseLog').on('click', togglePauseLog);
 uDom('#exportLog').on('click', exportLog);
+uDom('#filterExprPickerToggle').on('click', toggleFilterDropdown);
 uDom('#filterExprPicker').on('click', applyPresetFilter);
 
 window.addEventListener('hashchange', pageSelectorFromURLHash);

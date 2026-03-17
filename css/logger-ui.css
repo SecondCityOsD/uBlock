@@ -650,18 +650,53 @@ body.colorBlind  #netFilteringDialog .dialog > div.containers > div.dynamic tr.e
     outline: none;
     }
 
-/* ── Filter expression picker (pill buttons) ── */
+/* ── Toolbar spacer ── */
+.toolbar-spacer {
+    flex: 1;
+    }
+
+/* ── Filter expression dropdown (hidden by default) ── */
 #filterExprPicker {
+    background-color: #2d2d2d;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    color: white;
+    left: 50%;
+    padding: 12px 16px;
+    position: absolute;
+    top: 100%;
+    transform: translateX(-50%);
+    z-index: 100;
+    }
+#filterExprPicker.hide {
+    display: none;
+    }
+.filter-dropdown-title {
+    border-bottom: 1px solid #444;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    }
+.filter-dropdown-group {
     align-items: center;
-    display: inline-flex;
-    flex-shrink: 0;
-    gap: 3px;
-    vertical-align: middle;
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+    }
+.filter-dropdown-group:last-child {
+    margin-bottom: 0;
+    }
+.filter-dropdown-label {
+    color: #aaa;
+    font-size: 11px;
+    min-width: 50px;
     }
 .preset-pill {
-    background-color: #f1f3f4;
-    border: 1px solid #dadce0;
-    border-radius: 16px;
+    background-color: #444;
+    border: 1px solid #555;
+    border-radius: 12px;
+    color: #ddd;
     cursor: pointer;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 11px;
@@ -671,17 +706,13 @@ body.colorBlind  #netFilteringDialog .dialog > div.containers > div.dynamic tr.e
     white-space: nowrap;
     }
 .preset-pill:hover {
-    background-color: #e8eaed;
+    background-color: #555;
+    color: white;
     }
 .preset-pill.on {
     background-color: #1a73e8;
     border-color: #1a73e8;
     color: white;
-    }
-.sep {
-    border-left: 1px solid #dadce0;
-    height: 16px;
-    margin: 0 4px;
     }
 
 /* ── Table header ── */

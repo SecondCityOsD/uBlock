@@ -11,7 +11,7 @@
 </head>
 <body>
 
-<!-- Single toolbar row: everything on one line like Chrome -->
+<!-- Top toolbar: matches Chrome's single-row layout -->
 <div class="permatoolbar">
     <div class="toolbar-row">
         <select id="pageSelector">
@@ -23,22 +23,37 @@
         <span id="showdom" class="button fa" title="DOM inspector">&#xf121;</span>
         <span id="filterButton" class="button fa" title="Toggle filtering">&#xf0b0;</span>
         <input id="filterInput" type="search" placeholder="filter log entries" title="Filter entries (Ctrl+F)">
-        <div id="filterExprPicker">
-            <span class="preset-pill" data-expr="|--" title="Show only blocked requests">blocked</span>
-            <span class="preset-pill" data-expr="|++" title="Show only allowed requests">allowed</span>
-            <span class="preset-pill" data-expr="|<<" title="Show only redirected/modified requests">modified</span>
-            <span class="sep"></span>
-            <span class="preset-pill" data-expr="script" title="Show only script requests">script</span>
-            <span class="preset-pill" data-expr="xhr" title="Show only XHR/fetch requests">xhr</span>
-            <span class="preset-pill" data-expr="image" title="Show only image requests">image</span>
-            <span class="preset-pill" data-expr="css" title="Show only stylesheet requests">css</span>
-            <span class="preset-pill" data-expr="frame" title="Show only frame/iframe requests">frame</span>
-            <span class="sep"></span>
-            <span class="preset-pill" data-expr="error" title="Show only errors">errors</span>
-        </div>
+        <span id="filterExprPickerToggle" class="button fa" title="Filter expression picker">&#xf0d7;</span>
+        <span class="toolbar-spacer"></span>
         <span id="pauseLog" class="button fa" title="Pause/Resume logging (Space)">&#xf04c;</span>
         <span id="exportLog" class="button fa" title="Copy visible entries to clipboard (Ctrl+E)">&#xf0c5;</span>
         <input id="maxEntries" type="text" size="4" title="Maximum number of log entries">
+    </div>
+    <!-- Dropdown filter expression picker (hidden by default, shown on click) -->
+    <div id="filterExprPicker" class="filter-dropdown hide">
+        <div class="filter-dropdown-title">Enter filtering expression</div>
+        <div class="filter-dropdown-group">
+            <span class="filter-dropdown-label">Action:</span>
+            <span class="preset-pill" data-expr="|--" title="Show only blocked requests">blocked</span>
+            <span class="preset-pill" data-expr="|++" title="Show only allowed requests">allowed</span>
+            <span class="preset-pill" data-expr="|<<" title="Show only redirected/modified">modified</span>
+        </div>
+        <div class="filter-dropdown-group">
+            <span class="filter-dropdown-label">Type:</span>
+            <span class="preset-pill" data-expr="script" title="Script requests">script</span>
+            <span class="preset-pill" data-expr="xhr" title="XHR/fetch requests">xhr</span>
+            <span class="preset-pill" data-expr="image" title="Image requests">image</span>
+            <span class="preset-pill" data-expr="css" title="Stylesheet requests">css</span>
+            <span class="preset-pill" data-expr="frame" title="Frame/iframe requests">frame</span>
+            <span class="preset-pill" data-expr="media" title="Media requests">media</span>
+            <span class="preset-pill" data-expr="other" title="Other request types">other</span>
+        </div>
+        <div class="filter-dropdown-group">
+            <span class="filter-dropdown-label">Other:</span>
+            <span class="preset-pill" data-expr="error" title="Errors only">errors</span>
+            <span class="preset-pill" data-expr="cosmetic" title="Cosmetic filters">cosmetic</span>
+            <span class="preset-pill" data-expr="redirect" title="Redirected requests">redirect</span>
+        </div>
     </div>
 </div>
 
