@@ -54,9 +54,10 @@ textarea {
     vertical-align: middle;
     }
 #pageSelector {
-    min-width: 10em;
+    flex-shrink: 0;
+    min-width: 8em;
     padding: 0.2em 0;
-    width: 50vw;
+    width: auto;
     }
 
 /*
@@ -626,34 +627,22 @@ body.colorBlind  #netFilteringDialog .dialog > div.containers > div.dynamic tr.e
    Enhanced Logger UI — Modern Styling
    ══════════════════════════════════════════════════════════════════════════════ */
 
-/* ── Modern toolbar layout ── */
+/* ── Modern toolbar layout: single row, all items inline ── */
 .toolbar-row {
     align-items: center;
     display: flex;
-    justify-content: space-between;
+    gap: 4px;
+    overflow-x: auto;
+    white-space: nowrap;
     width: 100%;
-    }
-.toolbar-left,
-.toolbar-center,
-.toolbar-right {
-    align-items: center;
-    display: flex;
-    }
-.toolbar-center {
-    flex: 1;
-    justify-content: center;
-    margin: 0 12px;
-    }
-.toolbar-right {
-    gap: 2px;
     }
 #filterInput {
     border: 1px solid #d0d0d0;
     border-radius: 4px;
+    flex: 0 0 auto;
     font-size: 12px;
-    margin: 0 6px;
-    min-width: 180px;
     padding: 4px 8px;
+    width: 140px;
     }
 #filterInput:focus {
     border-color: #1a73e8;
@@ -665,6 +654,7 @@ body.colorBlind  #netFilteringDialog .dialog > div.containers > div.dynamic tr.e
 #filterExprPicker {
     align-items: center;
     display: inline-flex;
+    flex-shrink: 0;
     gap: 3px;
     vertical-align: middle;
     }

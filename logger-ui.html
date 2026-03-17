@@ -11,41 +11,34 @@
 </head>
 <body>
 
-<!-- Top toolbar: page selector + inspector toggles -->
+<!-- Single toolbar row: everything on one line like Chrome -->
 <div class="permatoolbar">
     <div class="toolbar-row">
-        <div class="toolbar-left">
-            <select id="pageSelector">
-                <option value="" data-i18n="logAll">
-                <option value="tab_bts" data-i18n="logBehindTheScene">
-                <option value="tab_active" data-i18n="loggerCurrentTab">
-            </select>
-            <span id="refresh" class="button fa disabled needtab">&#xf021;</span>
-            <span id="showdom" class="button fa">&#xf121;</span>
+        <select id="pageSelector">
+            <option value="" data-i18n="logAll">
+            <option value="tab_bts" data-i18n="logBehindTheScene">
+            <option value="tab_active" data-i18n="loggerCurrentTab">
+        </select>
+        <span id="refresh" class="button fa disabled needtab" title="Reload page">&#xf021;</span>
+        <span id="showdom" class="button fa" title="DOM inspector">&#xf121;</span>
+        <span id="filterButton" class="button fa" title="Toggle filtering">&#xf0b0;</span>
+        <input id="filterInput" type="search" placeholder="filter log entries" title="Filter entries (Ctrl+F)">
+        <div id="filterExprPicker">
+            <span class="preset-pill" data-expr="|--" title="Show only blocked requests">blocked</span>
+            <span class="preset-pill" data-expr="|++" title="Show only allowed requests">allowed</span>
+            <span class="preset-pill" data-expr="|<<" title="Show only redirected/modified requests">modified</span>
+            <span class="sep"></span>
+            <span class="preset-pill" data-expr="script" title="Show only script requests">script</span>
+            <span class="preset-pill" data-expr="xhr" title="Show only XHR/fetch requests">xhr</span>
+            <span class="preset-pill" data-expr="image" title="Show only image requests">image</span>
+            <span class="preset-pill" data-expr="css" title="Show only stylesheet requests">css</span>
+            <span class="preset-pill" data-expr="frame" title="Show only frame/iframe requests">frame</span>
+            <span class="sep"></span>
+            <span class="preset-pill" data-expr="error" title="Show only errors">errors</span>
         </div>
-        <div class="toolbar-center">
-            <span id="filterButton" class="button fa">&#xf0b0;</span>
-            <input id="filterInput" type="search" placeholder="filter log entries">
-            <div id="filterExprPicker">
-                <span class="preset-pill" data-expr="|--" title="Blocked requests">blocked</span>
-                <span class="preset-pill" data-expr="|++" title="Allowed requests">allowed</span>
-                <span class="preset-pill" data-expr="|<<" title="Redirected/modified">modified</span>
-                <span class="sep"></span>
-                <span class="preset-pill" data-expr="script" title="Scripts">script</span>
-                <span class="preset-pill" data-expr="xhr" title="XHR requests">xhr</span>
-                <span class="preset-pill" data-expr="image" title="Images">image</span>
-                <span class="preset-pill" data-expr="css" title="Stylesheets">css</span>
-                <span class="preset-pill" data-expr="frame" title="Frames">frame</span>
-                <span class="preset-pill" data-expr="other" title="Other types">other</span>
-                <span class="sep"></span>
-                <span class="preset-pill" data-expr="error" title="Errors only">errors</span>
-            </div>
-        </div>
-        <div class="toolbar-right">
-            <span id="pauseLog" class="button fa" title="Pause/Resume (Space)">&#xf04c;</span>
-            <span id="exportLog" class="button fa" title="Copy to clipboard (Ctrl+E)">&#xf0c5;</span>
-            <input id="maxEntries" type="text" size="5" title="logMaxEntriesTip">
-        </div>
+        <span id="pauseLog" class="button fa" title="Pause/Resume logging (Space)">&#xf04c;</span>
+        <span id="exportLog" class="button fa" title="Copy visible entries to clipboard (Ctrl+E)">&#xf0c5;</span>
+        <input id="maxEntries" type="text" size="4" title="Maximum number of log entries">
     </div>
 </div>
 
