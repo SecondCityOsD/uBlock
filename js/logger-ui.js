@@ -1727,49 +1727,25 @@ readLogBuffer = function() {
     _origReadLogBuffer();
 };
 
-// ── Preset filter buttons ──
-
-var activePreset = '';
+// ── Preset filter pills (expression picker) ──
 
 var applyPresetFilter = function(ev) {
-    var btn = ev.target;
-    var preset = btn.id;
+    var pill = ev.target;
+    if ( !pill.classList.contains('preset-pill') ) { return; }
+
     var filterInput = document.getElementById('filterInput');
+    var expr = pill.getAttribute('data-expr') || '';
 
-    // Toggle off if already active
-    if ( activePreset === preset ) {
-        activePreset = '';
-        btn.classList.remove('active');
-        filterInput.value = '';
-        filterInput.dispatchEvent(new Event('input'));
-        return;
+    // Toggle the pill on/off
+    pill.classList.toggle('on');
+
+    // Build combined filter from all active pills
+    var activePills = document.querySelectorAll('.preset-pill.on');
+    var parts = [];
+    for ( var i = 0; i < activePills.length; i++ ) {
+        parts.push(activePills[i].getAttribute('data-expr'));
     }
-
-    // Clear previous active
-    var prev = document.querySelector('.preset-btn.active');
-    if ( prev ) { prev.classList.remove('active'); }
-
-    activePreset = preset;
-    btn.classList.add('active');
-
-    // Set the filter input based on preset
-    switch ( preset ) {
-    case 'filterBlocked':
-        filterInput.value = '|--';
-        break;
-    case 'filterAllowed':
-        filterInput.value = '|++';
-        break;
-    case 'filter3p':
-        filterInput.value = '|3p';
-        break;
-    case 'filterErrors':
-        filterInput.value = 'error';
-        break;
-    default:
-        filterInput.value = '';
-        break;
-    }
+    filterInput.value = parts.join(' ');
     filterInput.dispatchEvent(new Event('input'));
 };
 
@@ -1845,15 +1821,16 @@ document.addEventListener('keydown', function(ev) {
         togglePauseLog();
         return;
     }
-    // Escape: clear filter
+    // Escape: clear filter and deactivate all pills
     if ( ev.key === 'Escape' ) {
         var filterInput = document.getElementById('filterInput');
         if ( filterInput.value !== '' ) {
             filterInput.value = '';
             filterInput.dispatchEvent(new Event('input'));
-            var prev = document.querySelector('.preset-btn.active');
-            if ( prev ) { prev.classList.remove('active'); }
-            activePreset = '';
+            var activePills = document.querySelectorAll('.preset-pill.on');
+            for ( var p = 0; p < activePills.length; p++ ) {
+                activePills[p].classList.remove('on');
+            }
         }
         return;
     }
@@ -1879,10 +1856,7 @@ uDom('#netInspector').on('click', 'tr.cat_net > td:nth-of-type(4)', netFiltering
 // Enhanced logger event handlers
 uDom('#pauseLog').on('click', togglePauseLog);
 uDom('#exportLog').on('click', exportLog);
-uDom('#filterBlocked').on('click', applyPresetFilter);
-uDom('#filterAllowed').on('click', applyPresetFilter);
-uDom('#filter3p').on('click', applyPresetFilter);
-uDom('#filterErrors').on('click', applyPresetFilter);
+uDom('#filterExprPicker').on('click', applyPresetFilter);
 
 window.addEventListener('hashchange', pageSelectorFromURLHash);
 
