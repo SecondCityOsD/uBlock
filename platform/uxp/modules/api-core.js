@@ -153,23 +153,31 @@ const Messaging = class {
         this.onMessage = new EventManager('runtime.onMessage');
     }
 
-    // TODO(Phase 2): add `tab` for pages shown in a tab.
+    // As in Firefox, senders shown in a tab also send their tab.
     senderOf(context) {
-        return {
+        const sender = {
             id: this.extension.id,
             url: context.url,
-            origin: this.extension.origin,
+            origin: context.origin,
             frameId: context.frameId,
-            envType: 'addon_child',
+            envType: context.isContentScript ? 'content_child' : 'addon_child',
         };
+        const tracker = this.extension.tabTracker;
+        const tab = tracker !== null ? tracker.tabForContext(context) : null;
+        if ( tab !== null ) {
+            sender.tab = tracker.convertTab(tab);
+        }
+        return sender;
     }
 
-    receiversOf(manager, context) {
+    // runtime.* messages reach extension pages only; content scripts are
+    // reached through tabs.sendMessage() and tabs.connect() (api-content.js),
+    // which pass their own `accept`.
+    receiversOf(manager, context, accept = other => other.isContentScript === false) {
         const out = new Set();
         for ( const { context: other } of manager.listeners() ) {
-            if ( other !== context && other.unloaded === false ) {
-                out.add(other);
-            }
+            if ( other === context || other.unloaded || accept(other) === false ) { continue; }
+            out.add(other);
         }
         return Array.from(out);
     }
@@ -177,9 +185,12 @@ const Messaging = class {
     // connect([extensionId], [connectInfo])
     connect(context, ...args) {
         const info = args.find(a => a !== null && typeof a === 'object') || {};
-        const name = typeof info.name === 'string' ? info.name : '';
+        return this.connectTo(context, info.name, this.receiversOf(this.onConnect, context));
+    }
+
+    connectTo(context, portName, receivers) {
+        const name = typeof portName === 'string' ? portName : '';
         const local = new PortEnd(context, name);
-        const receivers = this.receiversOf(this.onConnect, context);
         if ( receivers.length === 0 ) {
             local.remoteDisconnected(NO_RECEIVER);
         }
@@ -200,7 +211,10 @@ const Messaging = class {
     // given through sendResponse() or a returned Promise.
     sendMessage(context, ...args) {
         const message = args.length > 1 && typeof args[0] === 'string' ? args[1] : args[0];
-        const receivers = this.receiversOf(this.onMessage, context);
+        return this.deliver(context, message, this.receiversOf(this.onMessage, context));
+    }
+
+    deliver(context, message, receivers) {
         if ( receivers.length === 0 ) {
             return Promise.reject(new ExtensionError(NO_RECEIVER));
         }
@@ -633,10 +647,6 @@ const createPlaceholders = function(extension) {
         report(name);
         return result;
     });
-    const failsYet = name => apiAsync(( ) => {
-        report(name);
-        throw new ExtensionError(`browser.${name}() is not implemented yet`);
-    });
     const events = (namespace, names) => Object.fromEntries(
         names.map(name => [ name, new EventManager(`${namespace}.${name}`) ])
     );
@@ -660,70 +670,6 @@ const createPlaceholders = function(extension) {
     const commands = extension.manifest.commands || {};
 
     return {
-        tabs: {
-            TAB_ID_NONE: -1,
-            query: notYet('tabs.query', []),
-            get: failsYet('tabs.get'),
-            getCurrent: notYet('tabs.getCurrent'),
-            create: failsYet('tabs.create'),
-            update: failsYet('tabs.update'),
-            remove: failsYet('tabs.remove'),
-            reload: failsYet('tabs.reload'),
-            move: failsYet('tabs.move'),
-            executeScript: failsYet('tabs.executeScript'),
-            insertCSS: failsYet('tabs.insertCSS'),
-            removeCSS: failsYet('tabs.removeCSS'),
-            sendMessage: failsYet('tabs.sendMessage'),
-            ...events('tabs', [
-                'onActivated', 'onAttached', 'onCreated', 'onDetached',
-                'onHighlighted', 'onMoved', 'onRemoved', 'onReplaced',
-                'onUpdated',
-            ]),
-        },
-        windows: {
-            WINDOW_ID_NONE: -1,
-            WINDOW_ID_CURRENT: -2,
-            get: failsYet('windows.get'),
-            getCurrent: failsYet('windows.getCurrent'),
-            getLastFocused: failsYet('windows.getLastFocused'),
-            getAll: notYet('windows.getAll', []),
-            create: failsYet('windows.create'),
-            update: failsYet('windows.update'),
-            remove: failsYet('windows.remove'),
-            ...events('windows', [ 'onCreated', 'onFocusChanged', 'onRemoved' ]),
-        },
-        webNavigation: {
-            getFrame: notYet('webNavigation.getFrame', null),
-            getAllFrames: notYet('webNavigation.getAllFrames', null),
-            ...events('webNavigation', [
-                'onBeforeNavigate', 'onCommitted', 'onDOMContentLoaded',
-                'onCompleted', 'onErrorOccurred', 'onCreatedNavigationTarget',
-                'onHistoryStateUpdated', 'onReferenceFragmentUpdated',
-                'onTabReplaced',
-            ]),
-        },
-        webRequest: {
-            ResourceType: {
-                BEACON: 'beacon', CSP_REPORT: 'csp_report', FONT: 'font',
-                IMAGE: 'image', IMAGESET: 'imageset', MAIN_FRAME: 'main_frame',
-                MEDIA: 'media', OBJECT: 'object',
-                OBJECT_SUBREQUEST: 'object_subrequest', OTHER: 'other',
-                PING: 'ping', SCRIPT: 'script', SPECULATIVE: 'speculative',
-                STYLESHEET: 'stylesheet', SUB_FRAME: 'sub_frame',
-                WEB_MANIFEST: 'web_manifest', WEBSOCKET: 'websocket',
-                XML_DTD: 'xml_dtd', XMLHTTPREQUEST: 'xmlhttprequest',
-                XSLT: 'xslt',
-            },
-            MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
-            // Nothing is cached, so nothing to flush. uBO calls this once its
-            // filtering engines are (re)built: see Extension.onFiltersReady().
-            handlerBehaviorChanged: apiAsync(( ) => { extension.onFiltersReady(); }),
-            ...events('webRequest', [
-                'onBeforeRequest', 'onBeforeSendHeaders', 'onSendHeaders',
-                'onHeadersReceived', 'onAuthRequired', 'onResponseStarted',
-                'onBeforeRedirect', 'onCompleted', 'onErrorOccurred',
-            ]),
-        },
         browserAction: {
             setTitle: notYet('browserAction.setTitle'),
             getTitle: notYet('browserAction.getTitle', ''),
@@ -769,59 +715,67 @@ const createCoreAPIs = function(extension) {
     const messaging = new Messaging(extension);
     const storage = new StorageService(extension);
     const alarms = new AlarmService();
-    const placeholders = createPlaceholders(extension);
     const runtimeEvents = {
         onInstalled: new EventManager('runtime.onInstalled'),
         onStartup: new EventManager('runtime.onStartup'),
         onUpdateAvailable: new EventManager('runtime.onUpdateAvailable'),
     };
+    extension.messaging = messaging;
 
     extension.onShutdown(( ) => {
         alarms.clearAll();
         storage.close();
     });
 
-    return {
-        build(context) {
-            return Object.assign({
-                runtime: {
-                    id: extension.id,
-                    lastError: undefined,
-                    getURL: apiSync((ctx, path) => extension.getURL(path)),
-                    getManifest: apiSync(( ) => extension.localizedManifest()),
-                    getPlatformInfo: apiAsync(( ) => platformInfo()),
-                    getBrowserInfo: apiAsync(( ) => ({
-                        name: Services.appinfo.name,
-                        vendor: Services.appinfo.vendor,
-                        version: Services.appinfo.version,
-                        buildID: Services.appinfo.appBuildID,
-                    })),
-                    reload: apiSync(( ) => { dispatch(( ) => { extension.reload(); }); }),
-                    connect: apiSync((ctx, ...args) => messaging.connect(ctx, ...args)),
-                    sendMessage: apiAsync((ctx, ...args) => messaging.sendMessage(ctx, ...args)),
-                    onConnect: messaging.onConnect,
-                    onMessage: messaging.onMessage,
-                    ...runtimeEvents,
-                },
-                i18n: {
-                    getMessage: apiSync((ctx, name, substitutions) =>
-                        extension.localize(name, substitutions)
-                    ),
-                    getUILanguage: apiSync(( ) => extension.locales.uiLocale),
-                    getAcceptLanguages: apiAsync(( ) => acceptLanguages()),
-                    detectLanguage: apiAsync(( ) => ({ isReliable: false, languages: [] })),
-                },
-                storage: storage.namespace(),
-                alarms: {
-                    create: apiSync((ctx, ...args) => { alarms.create(...args); }),
-                    get: apiAsync((ctx, name) => alarms.get(name)),
-                    getAll: apiAsync(( ) => alarms.getAll()),
-                    clear: apiAsync((ctx, name) => alarms.clear(name)),
-                    clearAll: apiAsync(( ) => alarms.clearAll()),
-                    onAlarm: alarms.onAlarm,
-                },
-            }, placeholders);
+    // The parts of runtime and i18n Firefox also gives content scripts.
+    // (Firefox gives them storage too; uBO's content scripts do not use it.)
+    const contentRuntime = {
+        id: extension.id,
+        lastError: undefined,
+        getURL: apiSync((ctx, path) => extension.getURL(path)),
+        getManifest: apiSync(( ) => extension.localizedManifest()),
+        connect: apiSync((ctx, ...args) => messaging.connect(ctx, ...args)),
+        sendMessage: apiAsync((ctx, ...args) => messaging.sendMessage(ctx, ...args)),
+        onConnect: messaging.onConnect,
+        onMessage: messaging.onMessage,
+    };
+    const i18n = {
+        getMessage: apiSync((ctx, name, substitutions) =>
+            extension.localize(name, substitutions)
+        ),
+        getUILanguage: apiSync(( ) => extension.locales.uiLocale),
+        getAcceptLanguages: apiAsync(( ) => acceptLanguages()),
+        detectLanguage: apiAsync(( ) => ({ isReliable: false, languages: [] })),
+    };
+
+    // Built once: Extension.buildAPI() never modifies a module's tree.
+    const pageTree = Object.assign({
+        runtime: Object.assign({
+            getPlatformInfo: apiAsync(( ) => platformInfo()),
+            getBrowserInfo: apiAsync(( ) => ({
+                name: Services.appinfo.name,
+                vendor: Services.appinfo.vendor,
+                version: Services.appinfo.version,
+                buildID: Services.appinfo.appBuildID,
+            })),
+            reload: apiSync(( ) => { dispatch(( ) => { extension.reload(); }); }),
+        }, contentRuntime, runtimeEvents),
+        i18n,
+        storage: storage.namespace(),
+        alarms: {
+            create: apiSync((ctx, ...args) => { alarms.create(...args); }),
+            get: apiAsync((ctx, name) => alarms.get(name)),
+            getAll: apiAsync(( ) => alarms.getAll()),
+            clear: apiAsync((ctx, name) => alarms.clear(name)),
+            clearAll: apiAsync(( ) => alarms.clearAll()),
+            onAlarm: alarms.onAlarm,
         },
+    }, createPlaceholders(extension));
+    const contentTree = { runtime: contentRuntime, i18n };
+
+    return {
+        build: ( ) => pageTree,
+        buildContent: ( ) => contentTree,
 
         // Firefox fires these once the background page has loaded.
         onBackgroundLoaded(reason) {

@@ -65,21 +65,41 @@ const PageValue = class {
 const apiSync = fn => ({ [KIND]: 'sync', fn });
 const apiAsync = fn => ({ [KIND]: 'async', fn });
 
+// As web origins are serialized: "null" for opaque ones.
+const originOf = function(principal) {
+    try {
+        if ( principal.isNullPrincipal ) { return 'null'; }
+        return principal.originNoSuffix;
+    } catch (ex) {
+    }
+    return 'null';
+};
+
 /******************************************************************************/
 
+// An extension page, or a content script (viewType 'content_script'). Its
+// API objects live in `global`: the page itself, or the content script's
+// sandbox.
+
 const Context = class {
-    constructor(extension, window, viewType) {
+    constructor(extension, window, viewType, global = window) {
         this.extension = extension;
         this.window = window;
-        this.waived = Cu.waiveXrays(window);
+        this.waived = Cu.waiveXrays(global);
         this.viewType = viewType;
-        this.url = window.document.documentURI;
+        this.isContentScript = viewType === 'content_script';
+        const doc = window.document;
+        this.url = doc.documentURI;
+        this.origin = originOf(doc.nodePrincipal);
         const utils = window.QueryInterface(Ci.nsIInterfaceRequestor)
             .getInterface(Ci.nsIDOMWindowUtils);
         this.innerWindowID = utils.currentInnerWindowID;
         this.frameId = window.top === window ? 0 : utils.outerWindowID;
         this.unloaded = false;
         this.unloadCallbacks = new Set();
+        // runtime.lastError, set while a callback runs.
+        this.lastError = undefined;
+        this.lastErrorChecked = true;
     }
 
     callOnUnload(callback) {
@@ -156,6 +176,37 @@ const Context = class {
             settlers.reject(this.pageError(reason));
         });
         return promise;
+    }
+
+    // Chrome's callback form, which Firefox accepts too: the callback gets
+    // the result, or no argument with runtime.lastError set while it runs.
+    settleCallback(result, callback) {
+        Promise.resolve(result).then(value => {
+            if ( this.unloaded ) { return; }
+            let pageValue;
+            try {
+                pageValue = this.cloneOut(value);
+            } catch (ex) {
+                this.callWithLastError(callback, ex);
+                return;
+            }
+            this.callPage(callback, [ pageValue ]);
+        }, reason => {
+            if ( this.unloaded ) { return; }
+            this.callWithLastError(callback, reason);
+        });
+    }
+
+    callWithLastError(callback, reason) {
+        const error = this.pageError(reason);
+        this.lastError = error;
+        this.lastErrorChecked = false;
+        this.callPage(callback, []);
+        this.lastError = undefined;
+        if ( this.lastErrorChecked === false ) {
+            Cu.reportError(`Unchecked runtime.lastError: ${error.message}`);
+        }
+        this.lastErrorChecked = true;
     }
 
     // Call a page function; its exceptions are reported, not propagated.
@@ -309,13 +360,19 @@ const makeFunction = function(context, member) {
     }
     return (...args) => {
         if ( context.unloaded ) { return; }
+        const callback = typeof args[args.length - 1] === 'function'
+            ? args.pop()
+            : null;
         let result;
         try {
             result = fn(context, ...args.map(a => context.cloneIn(a)));
         } catch (ex) {
             result = Promise.reject(ex);
         }
-        return context.pagePromise(result);
+        if ( callback === null ) {
+            return context.pagePromise(result);
+        }
+        context.settleCallback(result, callback);
     };
 };
 
@@ -386,6 +443,16 @@ const installPolyfills = function(context) {
 // Define `browser` (and its `chrome` alias, as Firefox does) in the page.
 const injectAPI = function(context, tree) {
     const api = makeObject(context, tree);
+    if ( api.runtime !== undefined ) {
+        Object.defineProperty(api.runtime, 'lastError', {
+            get: context.exportFunction(( ) => {
+                context.lastErrorChecked = true;
+                return context.lastError;
+            }),
+            enumerable: true,
+            configurable: true,
+        });
+    }
     for ( const name of [ 'browser', 'chrome' ] ) {
         Object.defineProperty(context.waived, name, {
             value: api,
@@ -394,7 +461,9 @@ const injectAPI = function(context, tree) {
             writable: true,
         });
     }
-    installPolyfills(context);
+    if ( context.isContentScript === false ) {
+        installPolyfills(context);
+    }
 };
 
 /******************************************************************************/

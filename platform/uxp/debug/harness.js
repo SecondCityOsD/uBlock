@@ -21,8 +21,13 @@
 // Shipped only in debug builds (tools/make-uxp.mjs --debug). Driven by prefs
 // under extensions.ublock0.uxpTest., which tools/uxp-test.mjs writes into a
 // throwaway profile:
-//   scenario  ''      mirror the console to <profile>/uxp-test/console.log
-//             'probe' also probe the platform and write probe.json
+//   scenario  ''         mirror the console to <profile>/uxp-test/console.log
+//             'probe'    also probe the platform
+//             'boot'     ... check that uBO boots completely
+//             'network'  ... check network filtering, from browser launch on
+//             'cosmetic' ... check cosmetic filters, scriptlets, and the
+//                        content-script APIs
+//             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
 
@@ -675,7 +680,7 @@ const openTab = async function(url) {
         const d = tab.linkedBrowser.contentDocument;
         return d && d.documentURI === url && d.readyState === 'complete' ? d : null;
     }, 60000, url);
-    return { doc, close: ( ) => { win.gBrowser.removeTab(tab); } };
+    return { tab, doc, close: ( ) => { win.gBrowser.removeTab(tab); } };
 };
 
 const ownErrors = lines => lines
@@ -683,19 +688,29 @@ const ownErrors = lines => lines
     .filter(line => OWN_SOURCES.test(line.source))
     .map(line => `${line.text} @ ${line.source}`);
 
+const placeholdersHit = lines => Array.from(new Set(
+    lines.filter(l => l.text.includes('is not implemented yet')).map(l => l.text)
+));
+
+// The extension, its background page, and uBO once it reports "all ready"
+// (allReadyAfter starts as '?', see background.js).
+const whenUBOReady = async function() {
+    const ext = await waitFor(( ) => extension, 30000, 'the extension');
+    const bgWindow = await waitFor(( ) => ext.background && ext.background.window, 60000, 'the background page');
+    const µb = await waitFor(( ) => {
+        const µb = Cu.waiveXrays(bgWindow).µBlock;
+        return µb && µb.readyToFilter === true &&
+            µb.supportStats.allReadyAfter !== '?' ? µb : null;
+    }, 180000, 'uBO to report "all ready"');
+    return { ext, bgWindow, µb };
+};
+
 const runBoot = async function() {
     const report = {};
     let failure = null;
     try {
-        const ext = await waitFor(( ) => extension, 30000, 'the extension');
+        const { ext, bgWindow, µb } = await whenUBOReady();
         report.uuid = ext.uuid;
-        const bgWindow = await waitFor(( ) => ext.background && ext.background.window, 60000, 'the background page');
-        // allReadyAfter starts as '?' (background.js).
-        const µb = await waitFor(( ) => {
-            const µb = Cu.waiveXrays(bgWindow).µBlock;
-            return µb && µb.readyToFilter === true &&
-                µb.supportStats.allReadyAfter !== '?' ? µb : null;
-        }, 180000, 'uBO to report "all ready"');
         const doc = bgWindow.document;
         report.background = `${doc.documentURI} (principal ${doc.nodePrincipal.origin})`;
         // The runtime relaxes it during boot only (Extension.jsm).
@@ -745,14 +760,538 @@ const runBoot = async function() {
             ? `${report.dashboard.listEntries} filter lists rendered, principal ${report.dashboard.principal}`
             : undefined,
         contexts: report.contexts || [],
-        placeholdersHit: Array.from(new Set(
-            lines.filter(l => l.text.includes('is not implemented yet')).map(l => l.text)
-        )),
+        placeholdersHit: placeholdersHit(lines),
         ownErrors: ownErrors(lines),
         ubologTail: lines
             .filter(l => l.kind === 'console.info' && l.text.startsWith('[uBO]'))
             .slice(-15)
             .map(l => l.text.slice(0, 200)),
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
+// Network: a test page opened while uBO is still booting must not leak any
+// blocked request; uBO must attribute the page's requests to its tab, block
+// in subframes, and close a blocked popup.
+
+const NETWORK_FILTERS = [
+    '||127.0.0.1^*/uxp-blocked/',
+    '||localhost^*/uxp-blocked/',
+    '||localhost^*/popup.html$popup',
+];
+
+// Each test document records what loaded into body[data-results].
+const recorderScript = expected => `
+const results = {};
+const save = ( ) => { document.body.dataset.results = JSON.stringify(results); };
+for ( const img of document.images ) {
+    const mark = ok => { results[img.id] = ok; save(); };
+    if ( img.complete ) { mark(img.naturalWidth > 0); } else {
+        img.onload = ( ) => { mark(true); };
+        img.onerror = ( ) => { mark(false); };
+    }
+}
+${expected}
+save();`;
+
+const testRoutes = function(path, port) {
+    const html = body => ({ type: 'text/html; charset=utf-8', body: `<!doctype html><html><head><meta charset="utf-8">${body}</html>` });
+    const svg = color => ({
+        type: 'image/svg+xml',
+        body: `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="${color}"/></svg>`,
+    });
+    switch ( path ) {
+    case '/page.html':
+        return html(`<title>uxp-test</title>
+<script src="/ok/script.js"></script>
+<script src="/uxp-blocked/ad.js"></script>
+</head><body>
+<img id="okImage" src="/ok/image.svg"><img id="adImage" src="/uxp-blocked/ad.svg">
+<iframe id="frame" src="http://localhost:${port}/frame.html"></iframe>
+<script>${recorderScript(`
+results.okScript = window.okScript === true;
+results.adScript = window.adScript === true;
+for ( const path of [ '/ok/xhr.txt', '/uxp-blocked/xhr.txt' ] ) {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', path);
+    xhr.onload = ( ) => { results[path] = xhr.status; save(); };
+    xhr.onerror = ( ) => { results[path] = 'error'; save(); };
+    xhr.send();
+}
+setTimeout(( ) => { window.open('http://localhost:${port}/popup.html'); }, 500);`)}</script></body>`);
+    case '/frame.html':
+        return html(`</head><body><img id="okImage" src="/ok/frame-image.svg"><img id="adImage" src="/uxp-blocked/frame-ad.svg">
+<script>${recorderScript('')}</script></body>`);
+    case '/popup.html':
+        return html('<title>popup</title></head><body>popup</body>');
+    case '/ok/script.js':
+        return { type: 'application/javascript', body: 'window.okScript = true;' };
+    case '/uxp-blocked/ad.js':
+        return { type: 'application/javascript', body: 'window.adScript = true;' };
+    case '/ok/image.svg':
+    case '/ok/frame-image.svg':
+        return svg('green');
+    case '/uxp-blocked/ad.svg':
+    case '/uxp-blocked/frame-ad.svg':
+        return svg('red');
+    case '/ok/xhr.txt':
+    case '/uxp-blocked/xhr.txt':
+        return { type: 'text/plain', body: 'xhr' };
+    default:
+        return null;
+    }
+};
+
+// A minimal HTTP/1.1 server on the loopback interface. It records every
+// request it receives: a blocked resource must never show up there.
+const TestServer = class {
+    constructor(routes) {
+        this.routes = routes;
+        this.requests = [];
+        this.socket = null;
+        this.port = 0;
+    }
+
+    start() {
+        this.socket = Cc['@mozilla.org/network/server-socket;1']
+            .createInstance(Ci.nsIServerSocket);
+        this.socket.init(-1, true, -1);
+        this.port = this.socket.port;
+        this.socket.asyncListen({
+            onSocketAccepted: (server, transport) => { this.serve(transport); },
+            onStopListening() {},
+        });
+    }
+
+    stop() {
+        if ( this.socket === null ) { return; }
+        this.socket.close();
+        this.socket = null;
+    }
+
+    serve(transport) {
+        const input = transport.openInputStream(0, 0, 0).QueryInterface(Ci.nsIAsyncInputStream);
+        const output = transport.openOutputStream(Ci.nsITransport.OPEN_BLOCKING, 0, 0);
+        let received = '';
+        const reader = {
+            onInputStreamReady: stream => {
+                try {
+                    const scriptable = Cc['@mozilla.org/scriptableinputstream;1']
+                        .createInstance(Ci.nsIScriptableInputStream);
+                    scriptable.init(stream);
+                    received += scriptable.read(stream.available());
+                } catch (ex) {
+                    input.close();
+                    output.close();
+                    return;
+                }
+                if ( received.includes('\r\n\r\n') === false ) {
+                    input.asyncWait(reader, 0, 0, Services.tm.mainThread);
+                    return;
+                }
+                this.respond(received, output);
+                input.close();
+            },
+        };
+        input.asyncWait(reader, 0, 0, Services.tm.mainThread);
+    }
+
+    respond(request, output) {
+        const path = request.split('\r\n', 1)[0].split(' ')[1] || '/';
+        const host = (/^host:\s*(\S+)/im.exec(request) || [ '', '' ])[1];
+        this.requests.push(`${host.replace(/:\d+$/, '')}${path}`);
+        const route = this.routes(path.replace(/\?.*$/, ''), this.port);
+        const body = route !== null ? route.body : 'not found';
+        const response = [
+            `HTTP/1.1 ${route !== null ? '200 OK' : '404 Not Found'}`,
+            `Content-Type: ${route !== null ? route.type : 'text/plain'}`,
+            `Content-Length: ${body.length}`,
+            'Cache-Control: no-store',
+            'Connection: close',
+            '',
+            body,
+        ].join('\r\n');
+        output.write(response, response.length);
+        output.close();
+    }
+};
+
+const openTabs = function() {
+    const out = [];
+    const windows = Services.wm.getEnumerator('navigator:browser');
+    while ( windows.hasMoreElements() ) {
+        for ( const tab of windows.getNext().gBrowser.tabs ) {
+            out.push(tab);
+        }
+    }
+    return out;
+};
+
+const runNetwork = async function() {
+    const report = {};
+    let failure = null;
+    const server = new TestServer(testRoutes);
+    server.start();
+    try {
+        // Opened right away, while uBO is still booting.
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const tab = win.gBrowser.addTab(`http://127.0.0.1:${server.port}/page.html`, {});
+        win.gBrowser.selectedTab = tab;
+        const openedAt = Date.now();
+        const { ext, µb } = await whenUBOReady();
+        report.uboReadyAfterPageOpened = `${Date.now() - openedAt} ms`;
+        const doc = await waitFor(( ) => {
+            const d = tab.linkedBrowser.contentDocument;
+            if ( !d || d.readyState !== 'complete' || !d.body || !d.body.dataset.results ) { return null; }
+            return Object.keys(JSON.parse(d.body.dataset.results)).length >= 6 ? d : null;
+        }, 60000, 'the test page results');
+        report.page = JSON.parse(doc.body.dataset.results);
+        const frameDoc = doc.getElementById('frame').contentDocument;
+        report.frame = frameDoc && frameDoc.body && frameDoc.body.dataset.results
+            ? JSON.parse(frameDoc.body.dataset.results)
+            : null;
+        await sleep(3000);
+        report.popupTabsLeft = openTabs()
+            .filter(t => t.linkedBrowser.currentURI.spec.includes('/popup.html')).length;
+        const tabId = ext.tabTracker.getId(tab.linkedBrowser);
+        const tabContext = µb.tabContextManager.lookup(tabId);
+        report.tabAttribution = `tab ${tabId}: uBO's context URL ${tabContext ? tabContext.rawURL : 'none'}`;
+        const pageStore = µb.pageStoreFromTabId(tabId);
+        report.pageStoreCounts = pageStore ? plain(pageStore.counts) : null;
+    } catch (ex) {
+        failure = String(ex);
+    }
+    server.stop();
+    const leaks = server.requests.filter(p => p.includes('/uxp-blocked/'));
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        uboReadyAfterPageOpened: report.uboReadyAfterPageOpened,
+        noLeaksAtLaunch: leaks.length === 0 ? 'PASS' : `FAIL: ${leaks.join(', ')}`,
+        page: report.page,
+        frame: report.frame,
+        popupClosed: report.popupTabsLeft === 0 ? 'PASS' : `FAIL (${report.popupTabsLeft} left)`,
+        tabAttribution: report.tabAttribution,
+        pageStoreCounts: report.pageStoreCounts,
+        serverRequests: server.requests,
+        placeholdersHit: placeholdersHit(consoleLines),
+        ownErrors: ownErrors(consoleLines),
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
+// Cosmetic: uBO's specific, generic and procedural cosmetic filters hide
+// their targets in a page, its subframe and its about:blank frames, despite
+// the page's own `!important` styles (user-origin CSS); its scriptlet runs
+// before the page's first script; the content-script APIs behave as in
+// Firefox.
+//
+// Served from a name resolving to the loopback server (Gecko's
+// network.dns.localDomains): EasyList turns generic cosmetic filtering off on
+// 127.0.0.1 and localhost (`@@://127.0.0.1$generichide`).
+
+const COSMETIC_HOST = 'uxp-cosmetic.test';
+
+const COSMETIC_FILTERS = [
+    `${COSMETIC_HOST}##.uxp-ad`,
+    '##.uxp-generic-ad',
+    `${COSMETIC_HOST}##.uxp-proc:has-text(sponsored)`,
+    `${COSMETIC_HOST}##+js(set-constant, uxpScriptletValue, true)`,
+];
+
+const cosmeticRoutes = function(path) {
+    // Every document records what its first script sees of the scriptlet.
+    const html = (title, body) => ({
+        type: 'text/html; charset=utf-8',
+        body: `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>.uxp-ad, .uxp-generic-ad, .uxp-proc, .uxp-ok { display: block !important; }</style>
+<script>document.documentElement.dataset.scriptlet = String(window.uxpScriptletValue);</script>
+</head><body>${body}</body></html>`,
+    });
+    const ad = '<div id="specific" class="uxp-ad">ad</div>';
+    switch ( path ) {
+    case '/cosmetic.html':
+        return html('uxp-cosmetic', `<div id="ok" class="uxp-ok">ok</div>
+${ad}
+<div id="generic" class="uxp-generic-ad">ad</div>
+<div id="procedural" class="uxp-proc">sponsored</div>
+<div id="procOk" class="uxp-proc">article</div>
+<iframe id="frame" src="/cosmetic-frame.html"></iframe>
+<iframe id="blankWritten"></iframe>
+<iframe id="blankDOM"></iframe>
+<script>
+{
+    const doc = document.getElementById('blankWritten').contentDocument;
+    doc.open();
+    doc.write('<!doctype html><html><body>${ad}</body></html>');
+    doc.close();
+}
+// Gecko replaces a new frame's initial about:blank document once it loads.
+{
+    const frame = document.getElementById('blankDOM');
+    frame.addEventListener('load', ( ) => {
+        frame.contentDocument.body.innerHTML = '${ad}';
+    }, { once: true });
+}
+</script>`);
+    case '/cosmetic-frame.html':
+        return html('uxp-cosmetic-frame', `<div id="ok" class="uxp-ok">ok</div>${ad}`);
+    default:
+        return null;
+    }
+};
+
+const COSMETIC_EXPECTED = {
+    page: {
+        ok: 'shown',
+        specific: 'hidden',
+        generic: 'hidden',
+        procedural: 'hidden',
+        proceduralOther: 'shown',
+        scriptlet: 'true',
+    },
+    frame: { ok: 'shown', specific: 'hidden', scriptlet: 'true' },
+    aboutBlankWritten: { specific: 'hidden' },
+    aboutBlankDOM: { specific: 'hidden' },
+};
+
+const cosmeticState = function(doc) {
+    const display = (d, id) => {
+        const el = d && d.getElementById(id);
+        if ( !el ) { return 'missing'; }
+        return d.defaultView.getComputedStyle(el).display === 'none' ? 'hidden' : 'shown';
+    };
+    const frameDoc = id => {
+        const frame = doc.getElementById(id);
+        return frame ? frame.contentDocument : null;
+    };
+    const frame = frameDoc('frame');
+    return {
+        page: {
+            ok: display(doc, 'ok'),
+            specific: display(doc, 'specific'),
+            generic: display(doc, 'generic'),
+            procedural: display(doc, 'procedural'),
+            proceduralOther: display(doc, 'procOk'),
+            scriptlet: doc.documentElement.dataset.scriptlet,
+        },
+        frame: {
+            ok: display(frame, 'ok'),
+            specific: display(frame, 'specific'),
+            scriptlet: frame && frame.documentElement
+                ? frame.documentElement.dataset.scriptlet
+                : 'missing',
+        },
+        aboutBlankWritten: { specific: display(frameDoc('blankWritten'), 'specific') },
+        aboutBlankDOM: { specific: display(frameDoc('blankDOM'), 'specific') },
+    };
+};
+
+const API_EXPECTED = {
+    executeScriptCode: { value: [ 'uxp-cosmetic' ] },
+    executeScriptAllFrames: 4,
+    executeScriptFile: { value: [ false ] },
+    sendMessageNoReceiver: { error: 'Could not establish connection. Receiving end does not exist.' },
+    sendMessage: { value: { echo: 42, senderId: 'uBlock0@raymondhill.net' } },
+    connect: { value: { echo: 7, name: 'uxp-test' } },
+    insertCSS: 'none',
+    removeCSS: 'block',
+    callback: '1 tab(s)',
+    callbackLastError: { tab: 'undefined', lastError: 'Invalid tab ID: -1' },
+    lastErrorAfterCallback: 'undefined',
+};
+
+// What each content script has done: style sheets inserted, and the state of
+// uBO's content-side components (null: disabled by uBO).
+const contentScriptStates = ext => Array.from(ext.contexts.values())
+    .filter(c => c.isContentScript && c.unloaded === false)
+    .map(c => {
+        const vAPI = Cu.waiveXrays(c.sandbox).vAPI;
+        const state = v => v === null ? 'off' : v === undefined ? 'none' : 'on';
+        // typeof: `instanceof Object` does not hold across compartments.
+        const parts = typeof vAPI === 'object' && vAPI !== null
+            ? [ 'bootstrap', 'domFilterer', 'domSurveyor', 'domWatcher' ]
+                .map(name => `${name} ${state(vAPI[name])}`).join(', ')
+            : 'no vAPI';
+        return `${c.url} (frame ${c.frameId}): ${c.sheets.length} sheet(s); ${parts}`;
+    });
+
+const verdicts = (actual, expected) => Object.fromEntries(
+    Object.keys(expected).map(key => {
+        const json = JSON.stringify(actual[key]);
+        return [ key, json === JSON.stringify(expected[key]) ? 'PASS' : `FAIL: ${json}` ];
+    })
+);
+
+// Calls the background page's browser.* API as the page itself would;
+// settles with { value } or { error }.
+const callBackground = function(bgWindow, path, ...args) {
+    const page = Cu.waiveXrays(bgWindow);
+    const [ namespace, name ] = path.split('.');
+    return new Promise(resolve => {
+        page.browser[namespace][name](...args.map(a => Cu.cloneInto(a, page))).then(
+            Cu.exportFunction(value => { resolve({ value: plain(value) }); }, page),
+            Cu.exportFunction(error => { resolve({ error: String(error && error.message) }); }, page)
+        );
+    });
+};
+
+const checkContentAPIs = async function(bgWindow, tabId, doc) {
+    const page = Cu.waiveXrays(bgWindow);
+    const call = (path, ...args) => callBackground(bgWindow, path, ...args);
+    const out = {};
+    out.executeScriptCode = await call('tabs.executeScript', tabId, { code: 'document.title' });
+    out.executeScriptAllFrames = await call('tabs.executeScript', tabId, {
+        code: 'location.href',
+        allFrames: true,
+        matchAboutBlank: true,
+    });
+    // uBO's own check: runs in the sandbox of the declared content scripts.
+    out.executeScriptFile = await call('tabs.executeScript', tabId, {
+        file: '/js/scriptlets/should-inject-contentscript.js',
+    });
+    out.sendMessageNoReceiver = await call('tabs.sendMessage', tabId, { ping: 1 });
+    await call('tabs.executeScript', tabId, { code: `
+        browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            sendResponse({ echo: message.ping, senderId: sender.id });
+        });
+        browser.runtime.onConnect.addListener(port => {
+            port.onMessage.addListener(message => {
+                port.postMessage({ echo: message.ping, name: port.name });
+            });
+        });
+        0;` });
+    out.sendMessage = await call('tabs.sendMessage', tabId, { ping: 42 });
+    out.connect = await new Promise(resolve => {
+        const port = page.browser.tabs.connect(tabId, Cu.cloneInto({ name: 'uxp-test' }, page));
+        port.onMessage.addListener(Cu.exportFunction(message => {
+            resolve({ value: plain(message) });
+            port.disconnect();
+        }, page));
+        port.onDisconnect.addListener(Cu.exportFunction(( ) => {
+            resolve({ error: 'disconnected' });
+        }, page));
+        port.postMessage(Cu.cloneInto({ ping: 7 }, page));
+        setTimeout(( ) => { resolve({ error: 'timed out' }); }, 5000);
+    });
+    // A user-origin sheet beats the page's `!important`, and goes away.
+    const css = { code: '#ok { display: none !important; }', cssOrigin: 'user' };
+    const okDisplay = ( ) => doc.defaultView.getComputedStyle(doc.getElementById('ok')).display;
+    await call('tabs.insertCSS', tabId, css);
+    out.insertCSS = okDisplay();
+    await call('tabs.removeCSS', tabId, css);
+    out.removeCSS = okDisplay();
+    // Chrome's callback form, and runtime.lastError.
+    out.callback = await new Promise(resolve => {
+        page.chrome.tabs.query(
+            Cu.cloneInto({ active: true, currentWindow: true }, page),
+            Cu.exportFunction(tabs => { resolve(`${tabs.length} tab(s)`); }, page)
+        );
+    });
+    out.callbackLastError = await new Promise(resolve => {
+        page.chrome.tabs.get(-1, Cu.exportFunction(tab => {
+            const error = page.chrome.runtime.lastError;
+            resolve({ tab: String(tab), lastError: error ? String(error.message) : 'none' });
+        }, page));
+    });
+    out.lastErrorAfterCallback = String(page.chrome.runtime.lastError);
+    return out;
+};
+
+const runCosmetic = async function() {
+    const report = {};
+    let failure = null;
+    const server = new TestServer(cosmeticRoutes);
+    server.start();
+    try {
+        const { ext, bgWindow, µb } = await whenUBOReady();
+        // Navigation events of the test tab, as uBO receives them.
+        report.navigation = [];
+        const recorder = {
+            unloaded: false,
+            callOnUnload() {},
+            forgetOnUnload() {},
+            cloneOut: value => value,
+            callPage: (fn, args) => fn(...args),
+        };
+        for ( const name of [ 'onBeforeNavigate', 'onCommitted' ] ) {
+            ext.tabTracker.navigationEvents[name].addListener(recorder, details => {
+                report.navigation.push(`${name} frame ${details.frameId}: ${details.url}`);
+            });
+        }
+        // The notifications content scripts start from, for the test page's
+        // documents (about:blank ones have the page's principal).
+        report.documents = [];
+        const documentObserver = {
+            observe(subject, topic) {
+                const doc = topic === 'document-element-inserted' ? subject : subject.document;
+                if ( !doc || doc.nodePrincipal.origin.includes(COSMETIC_HOST) === false ) { return; }
+                const win = doc.defaultView;
+                const utils = win && win.QueryInterface(Ci.nsIInterfaceRequestor)
+                    .getInterface(Ci.nsIDOMWindowUtils);
+                report.documents.push([
+                    topic,
+                    utils ? `frame ${win.top === win ? 0 : utils.outerWindowID}` : 'no window',
+                    utils ? `inner ${utils.currentInnerWindowID}` : '',
+                    doc.documentURI,
+                    doc.documentElement ? '' : '(no root yet)',
+                ].join(' '));
+            },
+        };
+        const documentTopics = [ 'document-element-inserted', 'content-document-global-created' ];
+        for ( const topic of documentTopics ) {
+            Services.obs.addObserver(documentObserver, topic, false);
+        }
+        const page = await openTab(`http://${COSMETIC_HOST}:${server.port}/cosmetic.html`);
+        const { doc } = page;
+        // Content scripts work asynchronously: wait for the expected state,
+        // then report what there is.
+        const expected = JSON.stringify(COSMETIC_EXPECTED);
+        try {
+            await waitFor(( ) => JSON.stringify(cosmeticState(doc)) === expected, 15000, 'the cosmetic filters');
+        } catch (ex) {
+        }
+        for ( const topic of documentTopics ) {
+            Services.obs.removeObserver(documentObserver, topic);
+        }
+        report.cosmetic = cosmeticState(doc);
+        report.requestIdleCallback = typeof Cu.waiveXrays(doc.defaultView).requestIdleCallback;
+        report.contentScripts = contentScriptStates(ext);
+        const tabId = ext.tabTracker.getId(page.tab.linkedBrowser);
+        // The frames uBO knows of in the tab: it filters only those.
+        const pageStore = µb.pageStoreFromTabId(tabId);
+        report.uboFrames = pageStore
+            ? Array.from(pageStore.frames, ([ frameId, frame ]) => `${frameId}: ${frame.rawURL}`)
+            : null;
+        report.api = await checkContentAPIs(bgWindow, tabId, doc);
+        page.close();
+    } catch (ex) {
+        failure = String(ex);
+    }
+    server.stop();
+    const api = report.api && Object.assign({}, report.api, {
+        executeScriptAllFrames: report.api.executeScriptAllFrames.value
+            ? report.api.executeScriptAllFrames.value.length
+            : report.api.executeScriptAllFrames,
+    });
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        cosmetic: report.cosmetic && verdicts(report.cosmetic, COSMETIC_EXPECTED),
+        api: api && verdicts(api, API_EXPECTED),
+        requestIdleCallback: report.requestIdleCallback,
+        contentScripts: report.contentScripts,
+        uboFrames: report.uboFrames,
+        placeholdersHit: placeholdersHit(consoleLines),
+        ownErrors: ownErrors(consoleLines),
     };
     if ( failure !== null ) {
         report.error = failure;
@@ -782,6 +1321,14 @@ const whenBrowserReady = async function() {
 const scenarios = {
     probe: runProbes,
     boot: runBoot,
+    network: runNetwork,
+    cosmetic: runCosmetic,
+};
+
+// Filters given to uBO through managed storage.
+const SCENARIO_FILTERS = {
+    network: NETWORK_FILTERS,
+    cosmetic: COSMETIC_FILTERS,
 };
 
 const runScenario = async function(name) {
@@ -856,11 +1403,21 @@ const start = function(data, reason) {
             log(`experiment pref: ${name} = ${value}`);
         }
     }
-    // Test runs get uBO's own diagnostics (ubolog) through an admin setting.
+    // Test runs get uBO's own diagnostics (ubolog) through an admin setting,
+    // and their filters that way.
     if ( Services.prefs.prefHasUserValue(PREF_MANAGED_STORAGE) === false ) {
-        Services.prefs.setCharPref(PREF_MANAGED_STORAGE, JSON.stringify({
-            advancedSettings: [ [ 'consoleLogLevel', 'info' ] ],
-        }));
+        const managed = { advancedSettings: [ [ 'consoleLogLevel', 'info' ] ] };
+        if ( SCENARIO_FILTERS[scenario] !== undefined ) {
+            managed.toOverwrite = { filters: SCENARIO_FILTERS[scenario] };
+        }
+        Services.prefs.setCharPref(PREF_MANAGED_STORAGE, JSON.stringify(managed));
+    }
+    if ( scenario === 'network' ) {
+        // Let the test page's window.open() through the popup blocker.
+        Services.prefs.setBoolPref('dom.disable_open_during_load', false);
+    }
+    if ( scenario === 'cosmetic' ) {
+        Services.prefs.setCharPref('network.dns.localDomains', COSMETIC_HOST);
     }
     runScenario(scenario);
 };

@@ -19,8 +19,8 @@
 */
 
 // The extension itself: identity, moz-extension:// origin, permissions,
-// locales, background page, and the extension pages ("contexts") into which
-// the `browser` API is injected.
+// locales, background page, and the contexts into which the `browser` API
+// is injected -- extension pages here, content scripts in api-content.js.
 //
 // UXP still ships Firefox 52's substituting moz-extension: protocol handler
 // and its JS AddonPolicyService. Registering the same callbacks Firefox's
@@ -49,8 +49,9 @@ Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
 
 {
     const base = __URI__.slice(0, __URI__.lastIndexOf('/') + 1);
-    Services.scriptloader.loadSubScript(`${base}context.js`, this, 'UTF-8');
-    Services.scriptloader.loadSubScript(`${base}api-core.js`, this, 'UTF-8');
+    for ( const script of [ 'context.js', 'api-core.js', 'api-tabs.js', 'api-webrequest.js', 'api-content.js' ] ) {
+        Services.scriptloader.loadSubScript(`${base}${script}`, this, 'UTF-8');
+    }
 }
 
 /******************************************************************************/
@@ -88,7 +89,11 @@ var MatchPattern = class {
         } catch (ex) {
             return false;
         }
-        return this.matchers.some(matcher => matcher(parsed));
+        return this.matchesURL(parsed);
+    }
+    // `url`: an already parsed URL object.
+    matchesURL(url) {
+        return this.matchers.some(matcher => matcher(url));
     }
     static compile(pattern) {
         if ( pattern === '<all_urls>' ) {
@@ -167,10 +172,11 @@ const whenHiddenWindowReady = async function(isCancelled) {
 
 /******************************************************************************/
 
-const windowUtilsOf = win => win.QueryInterface(Ci.nsIInterfaceRequestor)
+// `var`: shared with the scripts loaded above.
+var windowUtilsOf = win => win.QueryInterface(Ci.nsIInterfaceRequestor)
     .getInterface(Ci.nsIDOMWindowUtils);
 
-const outerWindowIdOf = function(win) {
+var outerWindowIdOf = function(win) {
     try {
         return windowUtilsOf(win).outerWindowID;
     } catch (ex) {
@@ -178,7 +184,7 @@ const outerWindowIdOf = function(win) {
     return 0;
 };
 
-const logMessage = message => {
+var logMessage = message => {
     Services.console.logStringMessage(`uBlock0 UXP: ${message}`);
 };
 
@@ -375,7 +381,11 @@ var Extension = class {
         this.backgroundLoads = 0;
         this.backgroundRestarts = [];
         this.slowScriptLimit = new SlowScriptLimit();
-        this.apis = null;
+        this.coreAPIs = null;
+        this.apiModules = [];
+        this.tabTracker = null;
+        this.webRequest = null;
+        this.messaging = null;
         this.shutdownStarted = false;
         this.consoleListener = {
             observe: message => { this.onConsoleMessage(message); },
@@ -398,7 +408,14 @@ var Extension = class {
             )
         );
         this.registerOrigin();
-        this.apis = createCoreAPIs(this);
+        // Created in dependency order (webRequest uses the tab tracker,
+        // content scripts the tab tracker and messaging); merged core
+        // first, so implementations override its placeholders.
+        const tabs = createTabsAPIs(this);
+        const webRequest = createWebRequestAPIs(this);
+        this.coreAPIs = createCoreAPIs(this);
+        const content = createContentAPIs(this);
+        this.apiModules = [ this.coreAPIs, tabs, webRequest, content ];
         Services.obs.addObserver(this, 'document-element-inserted', false);
         Services.obs.addObserver(this, 'inner-window-destroyed', false);
         Services.console.registerListener(this.consoleListener);
@@ -440,6 +457,7 @@ var Extension = class {
 
     startBackground() {
         this.slowScriptLimit.relaxForBoot();
+        this.webRequest.startPriming();
         this.background = new BackgroundPage(this);
         return this.background.start();
     }
@@ -682,6 +700,32 @@ var Extension = class {
 
     /**************************************************************************/
 
+    // The API modules' trees merged into one; a later module's members
+    // replace an earlier one's. Namespaces are the plain objects: API
+    // members are EventManagers, PageValues, or tagged with a symbol.
+    // Content scripts get the trees of the modules with a buildContent().
+    buildAPI(context) {
+        const builder = context.isContentScript ? 'buildContent' : 'build';
+        const isNamespace = v => v !== null && typeof v === 'object' &&
+            Array.isArray(v) === false &&
+            v instanceof EventManager === false &&
+            v instanceof PageValue === false &&
+            Object.getOwnPropertySymbols(v).length === 0;
+        const merge = (target, source) => {
+            for ( const [ key, value ] of Object.entries(source) ) {
+                if ( isNamespace(value) && isNamespace(target[key]) ) {
+                    target[key] = merge(Object.assign({}, target[key]), value);
+                } else {
+                    target[key] = value;
+                }
+            }
+            return target;
+        };
+        return this.apiModules
+            .filter(module => typeof module[builder] === 'function')
+            .reduce((tree, module) => merge(tree, module[builder](context)), {});
+    }
+
     // Extension pages get the API before any of their scripts runs.
 
     observe(subject, topic, data) {
@@ -713,7 +757,7 @@ var Extension = class {
             this.unloadContext(context.innerWindowID);
         }, { once: true });
         try {
-            injectAPI(context, this.apis.build(context));
+            injectAPI(context, this.buildAPI(context));
         } catch (ex) {
             Cu.reportError(ex);
             return;
@@ -721,7 +765,7 @@ var Extension = class {
         // runtime.onInstalled/onStartup: once, not again after a restart.
         if ( viewType === 'background' && this.backgroundLoads++ === 0 ) {
             win.addEventListener('load', ( ) => {
-                this.apis.onBackgroundLoaded(this.startupReason);
+                this.coreAPIs.onBackgroundLoaded(this.startupReason);
             }, { once: true });
         }
     }
