@@ -1,0 +1,12 @@
+# Build output (tools/make-uxp.mjs)
+/dist/
+
+# Throwaway test profiles (tools/uxp-test.mjs)
+/.uxp-test/
+
+node_modules/
+
+# OS cruft
+Thumbs.db
+.DS_Store
+desktop.ini

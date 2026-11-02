@@ -1,0 +1,367 @@
+/*******************************************************************************
+
+    uBlock Origin for UXP - build script
+    Copyright (C) 2026-present uBlock-UXP contributors
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see {http://www.gnu.org/licenses/}.
+
+*/
+
+// Assembles dist/uBlock0_<version>.uxp.xpi from:
+//   upstream/      pristine uBlock Origin release tree (copied, never edited)
+//   platform/uxp/  the WebExtension runtime for UXP
+//
+// The upstream steps mirror upstream's own Firefox build, so the package
+// holds exactly what uBO's Firefox XPI holds, plus the UXP overlay:
+//   tools/copy-common-files.sh, tools/make-firefox.sh,
+//   tools/make-firefox-meta.py, tools/make-assets.sh
+//
+// Usage: node tools/make-uxp.mjs [--debug] [--no-assets] [--refresh-assets]
+//   --debug           include the test harness (platform/uxp/debug/)
+//   --no-assets       don't bundle filter lists (uBO fetches them at runtime)
+//   --refresh-assets  re-download the bundled filter lists
+
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+
+/******************************************************************************/
+
+// em:version is <upstream version>.<UXP_REVISION>. manifest.json keeps the
+// plain upstream version: uBO treats any version not matching \d+.\d+.\d+
+// exactly as a dev build (vapi-common.js), which changes its behavior.
+const UXP_REVISION = 1;
+
+const CHROME_PACKAGE = 'ublock0';
+
+const TARGET_APPLICATIONS = [
+    {   // Pale Moon
+        id: '{8de7fcbb-c55c-4fbe-bfc5-fc555c87dbc4}',
+        minVersion: '35.0',
+        maxVersion: '35.*',
+    },
+    {   // Basilisk: Firefox GUID, em:basilisk marks a Basilisk-aware add-on
+        id: '{ec8030f7-c20a-464f-9b0e-13a3a9e97384}',
+        minVersion: '52.9.2026',
+        maxVersion: '52.9.*',
+        basilisk: true,
+    },
+];
+
+// Filter lists shipped in the package so a fresh install filters before its
+// first list update. Same set as upstream's tools/make-assets.sh.
+const UASSETS_PROD = 'https://ublockorigin.github.io/uAssets/';
+const UASSETS_MAIN = 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/';
+const BUNDLED_ASSETS = [
+    [ 'ublock/badlists.txt', `${UASSETS_PROD}filters/badlists.txt` ],
+    [ 'ublock/badware.min.txt', `${UASSETS_PROD}filters/badware.min.txt` ],
+    [ 'ublock/filters.min.txt', `${UASSETS_PROD}filters/filters.min.txt` ],
+    [ 'ublock/privacy.min.txt', `${UASSETS_PROD}filters/privacy.min.txt` ],
+    [ 'ublock/quick-fixes.min.txt', `${UASSETS_PROD}filters/quick-fixes.min.txt` ],
+    [ 'ublock/unbreak.min.txt', `${UASSETS_PROD}filters/unbreak.min.txt` ],
+    [ 'thirdparties/easylist/easylist.txt', `${UASSETS_PROD}thirdparties/easylist.txt` ],
+    [ 'thirdparties/easylist/easyprivacy.txt', `${UASSETS_PROD}thirdparties/easyprivacy.txt` ],
+    [ 'thirdparties/pgl.yoyo.org/as/serverlist', `${UASSETS_MAIN}thirdparties/pgl.yoyo.org/as/serverlist` ],
+    [ 'thirdparties/publicsuffix.org/list/effective_tld_names.dat', `${UASSETS_MAIN}thirdparties/publicsuffix.org/list/effective_tld_names.dat` ],
+    [ 'thirdparties/urlhaus-filter/urlhaus-filter-online.txt', `${UASSETS_MAIN}thirdparties/urlhaus-filter/urlhaus-filter-online.txt` ],
+];
+
+/******************************************************************************/
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const UPSTREAM = path.join(ROOT, 'upstream');
+const PLATFORM = path.join(ROOT, 'platform', 'uxp');
+const DIST = path.join(ROOT, 'dist');
+const BUILD = path.join(DIST, 'build', 'uBlock0.uxp');
+const ASSETS_CACHE = path.join(DIST, 'uAssets-cache');
+
+/******************************************************************************/
+
+const copyDir = (from, to) => {
+    fs.cpSync(from, to, { recursive: true });
+};
+
+// Copy the files directly inside `fromDir` whose name matches `re`.
+const copyMatching = (fromDir, re, toDir) => {
+    fs.mkdirSync(toDir, { recursive: true });
+    for ( const entry of fs.readdirSync(fromDir, { withFileTypes: true }) ) {
+        if ( entry.isFile() === false || re.test(entry.name) === false ) { continue; }
+        fs.copyFileSync(path.join(fromDir, entry.name), path.join(toDir, entry.name));
+    }
+};
+
+const sortKeysDeep = value => {
+    if ( Array.isArray(value) ) { return value.map(sortKeysDeep); }
+    if ( value instanceof Object === false ) { return value; }
+    const out = {};
+    for ( const key of Object.keys(value).sort() ) {
+        out[key] = sortKeysDeep(value[key]);
+    }
+    return out;
+};
+
+const escapeXML = s => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+
+/******************************************************************************/
+
+// tools/copy-common-files.sh + tools/make-firefox.sh
+const assembleUpstream = des => {
+    const src = path.join(UPSTREAM, 'src');
+    copyDir(path.join(src, 'css'), path.join(des, 'css'));
+    copyDir(path.join(src, 'img'), path.join(des, 'img'));
+    copyMatching(path.join(src, 'js'), /\.js$/, path.join(des, 'js'));
+    for ( const dir of [ 'resources', 'codemirror', 'scriptlets', 'wasm' ] ) {
+        copyDir(path.join(src, 'js', dir), path.join(des, 'js', dir));
+    }
+    copyDir(path.join(src, 'lib'), path.join(des, 'lib'));
+    copyDir(path.join(src, 'web_accessible_resources'), path.join(des, 'web_accessible_resources'));
+    copyDir(path.join(src, '_locales'), path.join(des, '_locales'));
+    copyMatching(src, /\.html$/, des);
+    copyMatching(path.join(UPSTREAM, 'platform', 'common'), /\.js$/, path.join(des, 'js'));
+    copyMatching(path.join(UPSTREAM, 'platform', 'common'), /\.json$/, des);
+    fs.copyFileSync(path.join(UPSTREAM, 'LICENSE.txt'), path.join(des, 'LICENSE.txt'));
+
+    // Firefox-specific
+    copyMatching(path.join(UPSTREAM, 'platform', 'firefox'), /\.json$/, des);
+    copyMatching(path.join(UPSTREAM, 'platform', 'firefox'), /\.js$/, path.join(des, 'js'));
+    copyDir(path.join(des, '_locales', 'nb'), path.join(des, '_locales', 'no'));
+    fs.rmSync(path.join(des, 'img', 'icon_128.png'));
+};
+
+// tools/make-firefox-meta.py
+const writeFirefoxMeta = (des, version) => {
+    const file = path.join(des, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Upstream drops sidebar_action from stable (3-part) releases.
+    if ( /^\d+\.\d+\.\d+\.\d+$/.test(version) === false ) {
+        delete manifest.sidebar_action;
+    }
+    manifest.version = version;
+    fs.writeFileSync(file, JSON.stringify(sortKeysDeep(manifest), null, 2) + '\n');
+    return manifest;
+};
+
+// tools/make-assets.sh
+const bundleAssets = async (des, version, options) => {
+    const assetsDir = path.join(des, 'assets');
+    copyDir(path.join(UPSTREAM, 'assets'), assetsDir);
+    const isRelease = /^\d+\.\d+\.\d+$/.test(version);
+    fs.rmSync(path.join(assetsDir, isRelease ? 'assets.dev.json' : 'assets.json'));
+    if ( options.noAssets ) { return { bundled: 0, missing: [] }; }
+
+    const missing = [];
+    let bundled = 0;
+    for ( const [ rel, url ] of BUNDLED_ASSETS ) {
+        const cached = path.join(ASSETS_CACHE, rel);
+        if ( options.refreshAssets || fs.existsSync(cached) === false ) {
+            try {
+                const response = await fetch(url);
+                if ( response.ok === false ) { throw new Error(`HTTP ${response.status}`); }
+                const data = Buffer.from(await response.arrayBuffer());
+                if ( data.length === 0 ) { throw new Error('empty response'); }
+                fs.mkdirSync(path.dirname(cached), { recursive: true });
+                fs.writeFileSync(cached, data);
+            } catch (reason) {
+                missing.push(`${rel} (${reason.message})`);
+            }
+        }
+        if ( fs.existsSync(cached) === false ) { continue; }
+        fs.mkdirSync(path.dirname(path.join(assetsDir, rel)), { recursive: true });
+        fs.copyFileSync(cached, path.join(assetsDir, rel));
+        bundled += 1;
+    }
+    return { bundled, missing };
+};
+
+/******************************************************************************/
+
+const overlayPlatform = (des, options) => {
+    fs.copyFileSync(path.join(PLATFORM, 'bootstrap.js'), path.join(des, 'bootstrap.js'));
+    if ( fs.existsSync(path.join(PLATFORM, 'modules')) ) {
+        copyDir(path.join(PLATFORM, 'modules'), path.join(des, 'uxp'));
+    }
+    if ( options.debug ) {
+        copyDir(path.join(PLATFORM, 'debug'), path.join(des, 'uxp-debug'));
+    }
+    // The add-on manager picks these up for about:addons.
+    fs.copyFileSync(path.join(des, 'img', 'icon_32.png'), path.join(des, 'icon.png'));
+    fs.copyFileSync(path.join(des, 'img', 'icon_64.png'), path.join(des, 'icon64.png'));
+};
+
+const writeInstallRdf = (des, manifest, emVersion, options) => {
+    const messages = JSON.parse(
+        fs.readFileSync(path.join(des, '_locales', 'en', 'messages.json'), 'utf8')
+    );
+    const description = messages.extShortDesc.message;
+    const name = options.debug ? `${manifest.name} (UXP debug)` : manifest.name;
+    const targets = TARGET_APPLICATIONS.map(app => [
+        '    <em:targetApplication>',
+        '      <Description>',
+        `        <em:id>${app.id}</em:id>`,
+        `        <em:minVersion>${app.minVersion}</em:minVersion>`,
+        `        <em:maxVersion>${app.maxVersion}</em:maxVersion>`,
+        app.basilisk ? '        <em:basilisk>true</em:basilisk>' : '',
+        '      </Description>',
+        '    </em:targetApplication>',
+    ].filter(s => s !== '').join('\n'));
+    const rdf = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<RDF xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"',
+        '     xmlns:em="http://www.mozilla.org/2004/em-rdf#">',
+        '  <Description about="urn:mozilla:install-manifest">',
+        `    <em:id>${escapeXML(manifest.browser_specific_settings.gecko.id)}</em:id>`,
+        '    <em:type>2</em:type>',
+        `    <em:version>${emVersion}</em:version>`,
+        `    <em:name>${escapeXML(name)}</em:name>`,
+        `    <em:description>${escapeXML(description)}</em:description>`,
+        `    <em:creator>${escapeXML(manifest.author)}</em:creator>`,
+        '    <em:homepageURL>https://github.com/gorhill/uBlock</em:homepageURL>',
+        '    <em:bootstrap>true</em:bootstrap>',
+        '    <em:multiprocessCompatible>true</em:multiprocessCompatible>',
+        ...targets,
+        '  </Description>',
+        '</RDF>',
+        '',
+    ].join('\n');
+    fs.writeFileSync(path.join(des, 'install.rdf'), rdf);
+};
+
+const writeChromeManifest = des => {
+    fs.writeFileSync(
+        path.join(des, 'chrome.manifest'),
+        `content ${CHROME_PACKAGE} ./\n`
+    );
+};
+
+/******************************************************************************/
+
+const listFiles = (dir, prefix = '') => {
+    const out = [];
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+        .sort((a, b) => a.name < b.name ? -1 : 1);
+    for ( const entry of entries ) {
+        const rel = prefix + entry.name;
+        if ( entry.isDirectory() ) {
+            out.push(...listFiles(path.join(dir, entry.name), `${rel}/`));
+        } else {
+            out.push(rel);
+        }
+    }
+    return out;
+};
+
+// Minimal zip writer: forward-slash names, deflate when it helps, fixed
+// timestamp so identical inputs give an identical XPI.
+const DOS_DATE = ((2026 - 1980) << 9) | (1 << 5) | 1;
+const DOS_TIME = 0;
+
+const makeZip = (rootDir, names) => {
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    for ( const name of names ) {
+        const data = fs.readFileSync(path.join(rootDir, name));
+        const nameBuf = Buffer.from(name, 'utf8');
+        const crc = zlib.crc32(data);
+        const deflated = zlib.deflateRawSync(data, { level: 9 });
+        const method = deflated.length < data.length ? 8 : 0;
+        const body = method === 8 ? deflated : data;
+
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt16LE(0x0800, 6);
+        local.writeUInt16LE(method, 8);
+        local.writeUInt16LE(DOS_TIME, 10);
+        local.writeUInt16LE(DOS_DATE, 12);
+        local.writeUInt32LE(crc, 14);
+        local.writeUInt32LE(body.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(nameBuf.length, 26);
+        local.writeUInt16LE(0, 28);
+        parts.push(local, nameBuf, body);
+
+        const header = Buffer.alloc(46);
+        header.writeUInt32LE(0x02014b50, 0);
+        header.writeUInt16LE(20, 4);
+        header.writeUInt16LE(20, 6);
+        header.writeUInt16LE(0x0800, 8);
+        header.writeUInt16LE(method, 10);
+        header.writeUInt16LE(DOS_TIME, 12);
+        header.writeUInt16LE(DOS_DATE, 14);
+        header.writeUInt32LE(crc, 16);
+        header.writeUInt32LE(body.length, 20);
+        header.writeUInt32LE(data.length, 24);
+        header.writeUInt16LE(nameBuf.length, 28);
+        header.writeUInt32LE(offset, 42);
+        central.push(header, nameBuf);
+
+        offset += local.length + nameBuf.length + body.length;
+    }
+    const centralSize = central.reduce((n, b) => n + b.length, 0);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(names.length, 8);
+    end.writeUInt16LE(names.length, 10);
+    end.writeUInt32LE(centralSize, 12);
+    end.writeUInt32LE(offset, 16);
+    return Buffer.concat([ ...parts, ...central, end ]);
+};
+
+/******************************************************************************/
+
+const main = async ( ) => {
+    const args = new Set(process.argv.slice(2));
+    const options = {
+        debug: args.has('--debug'),
+        noAssets: args.has('--no-assets'),
+        refreshAssets: args.has('--refresh-assets'),
+    };
+
+    const version = fs.readFileSync(path.join(UPSTREAM, 'dist', 'version'), 'utf8').trim();
+    const emVersion = `${version}.${UXP_REVISION}`;
+
+    fs.rmSync(BUILD, { recursive: true, force: true });
+    fs.mkdirSync(BUILD, { recursive: true });
+
+    const assets = await bundleAssets(BUILD, version, options);
+    assembleUpstream(BUILD);
+    const manifest = writeFirefoxMeta(BUILD, version);
+    overlayPlatform(BUILD, options);
+    writeInstallRdf(BUILD, manifest, emVersion, options);
+    writeChromeManifest(BUILD);
+
+    const names = listFiles(BUILD);
+    const flavor = options.debug ? 'uxp-debug' : 'uxp';
+    const xpiPath = path.join(DIST, `uBlock0_${emVersion}.${flavor}.xpi`);
+    fs.writeFileSync(xpiPath, makeZip(BUILD, names));
+
+    const size = (fs.statSync(xpiPath).size / 1048576).toFixed(2);
+    console.log(`Built ${path.relative(ROOT, xpiPath)} (${names.length} files, ${size} MB)`);
+    console.log(`  upstream ${version}, em:version ${emVersion}, ${options.debug ? 'debug' : 'release'}`);
+    if ( options.noAssets ) {
+        console.log('  filter lists: not bundled (--no-assets)');
+    } else {
+        console.log(`  filter lists: ${assets.bundled}/${BUNDLED_ASSETS.length} bundled`);
+        for ( const entry of assets.missing ) {
+            console.warn(`  WARNING: not bundled: ${entry}`);
+        }
+    }
+};
+
+main().catch(reason => {
+    console.error(reason);
+    process.exitCode = 1;
+});
