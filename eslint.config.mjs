@@ -84,6 +84,7 @@ export default [
     // whole (upstream's are modules, strict by definition).
     {
         files: [ 'platform/uxp/**/*.js', 'platform/uxp/**/*.jsm' ],
+        ignores: [ 'platform/uxp/engine/**' ],
         languageOptions: {
             sourceType: 'script',
             globals: chromeGlobals,
@@ -102,6 +103,20 @@ export default [
         files: [ 'platform/uxp/**/*.jsm' ],
         languageOptions: {
             globals: { __URI__: 'readonly' },
+        },
+    },
+    // Code that runs as part of uBO's own: modules bundled with uBO's into
+    // the package (tools/make-uxp.mjs). worker.js runs in a worker.
+    {
+        files: [ 'platform/uxp/engine/**/*.js' ],
+        languageOptions: {
+            sourceType: 'module',
+        },
+    },
+    {
+        files: [ 'platform/uxp/engine/worker.js' ],
+        languageOptions: {
+            globals: globals.worker,
         },
     },
     // Build and test tools, run by Node.

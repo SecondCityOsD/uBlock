@@ -41,6 +41,8 @@
 //             'stop-busy' ... disable the add-on while pages load, while
 //                        it boots and while it filters; re-enable it
 //                        (keepConsoleLog: the next instance appends)
+//             'stalls'   ... measure the main thread's stalls on a first
+//                        install, a reload of all lists, a selfie save
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -2524,6 +2526,144 @@ const runStopBusy = async function() {
 
 /******************************************************************************/
 
+// Stalls: what blocks the browser's main thread, its only one, while uBO
+// builds its engines: on a first install, on a reload of all its lists (as
+// after a list update), and while it saves its selfie. A heartbeat every
+// 16 ms from the add-on's start: any gap is a freeze the user feels.
+
+const stalls = { started: 0, gaps: [], timer: null };
+
+const startStallMonitor = function() {
+    stalls.started = Date.now();
+    let last = stalls.started;
+    const tick = ( ) => {
+        const now = Date.now();
+        const gap = now - last - 16;
+        if ( gap >= 50 ) { stalls.gaps.push({ at: now - gap, ms: gap }); }
+        last = now;
+        stalls.timer = setTimeout(tick, 16);
+    };
+    stalls.timer = setTimeout(tick, 16);
+};
+
+// The gaps between two moments: the longest, how many above 100 ms, and the
+// three longest, with when they began (ms after `from`).
+const stallsBetween = function(from, to) {
+    const gaps = stalls.gaps.filter(g => g.at >= from && g.at < to);
+    return {
+        longestStallMs: gaps.reduce((max, g) => Math.max(max, g.ms), 0),
+        stallsOver100ms: gaps.filter(g => g.ms > 100).length,
+        longest: gaps.slice().sort((a, b) => b.ms - a.ms).slice(0, 3)
+            .map(g => `${g.ms} ms at +${g.at - from} ms`),
+    };
+};
+
+// A µBlock method of the background page, its Promise awaited.
+const callUBO = function(bgWindow, path, ...args) {
+    const page = Cu.waiveXrays(bgWindow);
+    const names = path.split('.');
+    const method = names.pop();
+    const target = names.reduce((object, name) => object[name], page.µBlock);
+    return new Promise(resolve => {
+        try {
+            Promise.resolve(target[method](...args.map(a => Cu.cloneInto(a, page)))).then(
+                ( ) => { resolve({}); },
+                error => { resolve({ error: String(error && error.message || error) }); }
+            );
+        } catch (ex) {
+            resolve({ error: String(ex && ex.message || ex) });
+        }
+    });
+};
+
+// How many filters each enabled list has, as the dashboard shows it. (How
+// many are used depends on the order the lists load in: a filter two lists
+// share is a duplicate in the second.)
+const listCounts = function(µb) {
+    const out = {};
+    for ( const [ key, entry ] of Object.entries(plain(µb.availableFilterLists)) ) {
+        if ( entry.off === true || entry.entryCount === undefined ) { continue; }
+        out[key] = entry.entryCount;
+    }
+    return out;
+};
+
+const runStalls = async function() {
+    const report = {};
+    let failure = null;
+    try {
+        const { bgWindow, µb } = await whenUBOReady();
+        report.firstInstall = { readyAfterMs: Date.now() - stalls.started };
+        await sleep(3000);
+        Object.assign(report.firstInstall, stallsBetween(stalls.started, Date.now()));
+        const countsBefore = listCounts(µb);
+
+        // All lists reloaded, from their compiled form, as after a list
+        // update. uBO holds network requests meanwhile.
+        let from = Date.now();
+        report.reload = await callUBO(bgWindow, 'loadFilterLists');
+        report.reload.durationMs = Date.now() - from;
+        await sleep(3000);
+        Object.assign(report.reload, stallsBetween(from, Date.now()));
+        report.reload.countsBefore = countsBefore;
+        report.reload.countsAfter = listCounts(µb);
+
+        // An update of urlhaus, the biggest list: compiled again, then all
+        // lists reloaded, as uBO's updater does.
+        from = Date.now();
+        await callUBO(bgWindow, 'removeCompiledFilterList', 'urlhaus-1');
+        report.update = await callUBO(bgWindow, 'loadFilterLists');
+        report.update.durationMs = Date.now() - from;
+        await sleep(3000);
+        Object.assign(report.update, stallsBetween(from, Date.now()));
+        report.update.countsAfter = listCounts(µb);
+
+        // uBO's selfie save, a minute after each rebuild.
+        from = Date.now();
+        report.selfie = await callUBO(bgWindow, 'selfieManager.create');
+        report.selfie.durationMs = Date.now() - from;
+        await sleep(2000);
+        Object.assign(report.selfie, stallsBetween(from, Date.now()));
+    } catch (ex) {
+        failure = String(ex);
+    }
+    clearTimeout(stalls.timer);
+    report.builtBy = consoleLines
+        .filter(l => /Network filters built/.test(l.text))
+        .map(l => l.text.replace(/^\[uBO\] loadFilterLists\(\) /, ''));
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { firstInstall = {}, reload = {}, update = {}, selfie = {} } = report;
+    const sameCounts = after => after !== undefined && JSON.stringify(after) === JSON.stringify(reload.countsBefore);
+    const checks = {
+        builtInWorker: pass(report.builtBy.length === 3 && report.builtBy.every(t => t.includes('in a worker')), report.builtBy),
+        reloadCountsUnchanged: pass(sameCounts(reload.countsAfter), reload.countsAfter),
+        updateCountsUnchanged: pass(sameCounts(update.countsAfter), update.countsAfter),
+        reloadNoFreeze: pass(reload.longestStallMs < 300, reload.longest),
+        selfieNoFreeze: pass(selfie.longestStallMs < 300, selfie.longest),
+    };
+    const brief = phase => phase && {
+        durationMs: phase.durationMs || phase.readyAfterMs,
+        longestStallMs: phase.longestStallMs,
+        stallsOver100ms: phase.stallsOver100ms,
+        longest: phase.longest,
+    };
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        firstInstall: brief(firstInstall),
+        reload: brief(reload),
+        update: brief(update),
+        selfie: brief(selfie),
+        builtBy: report.builtBy,
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -2552,6 +2692,7 @@ const scenarios = {
     'uninstall-disabled': ( ) => runUninstall(true),
     update: runUpdate,
     'stop-busy': runStopBusy,
+    stalls: runStalls,
 };
 
 // Filters and user settings given to uBO through managed storage.
@@ -2564,6 +2705,8 @@ const SCENARIO_FILTERS = {
 };
 const SCENARIO_USER_SETTINGS = {
     filtering: FILTERING_USER_SETTINGS,
+    // Its own update phase only: uBO's updater would overlap the others.
+    stalls: [ [ 'autoUpdate', 'false' ] ],
 };
 
 // Test pages served under a name of their own (network.dns.localDomains).
@@ -2669,6 +2812,10 @@ const start = function(data, reason) {
     }
     if ( SCENARIO_HOSTS[scenario] !== undefined ) {
         Services.prefs.setCharPref('network.dns.localDomains', SCENARIO_HOSTS[scenario]);
+    }
+    // From now on, before uBO starts.
+    if ( scenario === 'stalls' ) {
+        startStallMonitor();
     }
     runScenario(scenario);
 };

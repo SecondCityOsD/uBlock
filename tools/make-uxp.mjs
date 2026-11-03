@@ -28,16 +28,23 @@
 //   tools/make-firefox-meta.py, tools/make-assets.sh
 // One exception: constructs UXP's JavaScript engine runs far slower than
 // Firefox's are rewritten in the package's copy, behavior unchanged
-// (tools/uxp-compat.mjs).
+// (tools/uxp-compat.mjs). And where uBO's behavior has to differ on UXP,
+// its code is patched (tools/uxp-patches.mjs): its network filtering
+// engine is built in a worker (platform/uxp/engine/), bundled with that copy
+// of uBO's modules into js/uxp-engine-worker.js.
 //
 // A release build also writes dist/update.rdf, the update manifest that
 // offers it (PLAN.md, "Releasing").
 //
 // Usage: node tools/make-uxp.mjs [--debug] [--no-assets] [--refresh-assets]
+//            [--no-patches]
 //   --debug           include the test harness (platform/uxp/debug/)
 //   --no-assets       don't bundle filter lists (uBO fetches them at runtime)
 //   --refresh-assets  re-download the bundled filter lists
+//   --no-patches      leave uBO's code unpatched, to compare (not for release)
 
+import { applyPatches } from './uxp-patches.mjs';
+import { buildSync } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -181,6 +188,39 @@ const rewriteForUXP = des => {
         summary.files += 1;
     }
     return summary;
+};
+
+// The network filtering engine's worker: platform/uxp/engine/worker.js and
+// the modules it imports from the package's copy of uBO, rewrites included,
+// bundled into one plain worker script (UXP has no module workers); its
+// imports are relative to the package's root, where its entry is placed for
+// the time of the bundling. And its page side, which the patched storage.js
+// imports.
+const ENGINE_WORKER = 'js/uxp-engine-worker.js';
+const ENGINE_CLIENT = 'js/uxp-engine.js';
+
+const addEngine = des => {
+    fs.copyFileSync(path.join(PLATFORM, 'engine', 'client.js'), path.join(des, ENGINE_CLIENT));
+    const entry = path.join(des, 'uxp-engine-worker.entry.js');
+    fs.copyFileSync(path.join(PLATFORM, 'engine', 'worker.js'), entry);
+    try {
+        buildSync({
+            absWorkingDir: des,
+            entryPoints: [ entry ],
+            outfile: path.join(des, ENGINE_WORKER),
+            bundle: true,
+            format: 'iife',
+            charset: 'utf8',
+            legalComments: 'none',
+            logLevel: 'warning',
+            banner: {
+                js: '// Built by tools/make-uxp.mjs from platform/uxp/engine/worker.js and uBlock Origin\'s modules (GPLv3, see LICENSE.txt).',
+            },
+        });
+    } finally {
+        fs.rmSync(entry);
+    }
+    return fs.statSync(path.join(des, ENGINE_WORKER)).size;
 };
 
 // tools/make-firefox-meta.py
@@ -412,6 +452,7 @@ const main = async ( ) => {
         debug: args.has('--debug'),
         noAssets: args.has('--no-assets'),
         refreshAssets: args.has('--refresh-assets'),
+        patches: args.has('--no-patches') === false,
     };
 
     const version = fs.readFileSync(path.join(UPSTREAM, 'dist', 'version'), 'utf8').trim();
@@ -423,6 +464,8 @@ const main = async ( ) => {
     const assets = await bundleAssets(BUILD, version, options);
     assembleUpstream(BUILD);
     const compat = rewriteForUXP(BUILD);
+    const patched = options.patches ? applyPatches(BUILD) : [];
+    const workerSize = addEngine(BUILD);
     const manifest = writeFirefoxMeta(BUILD, version);
     overlayPlatform(BUILD, options);
     writeInstallRdf(BUILD, manifest, emVersion, options);
@@ -440,6 +483,8 @@ const main = async ( ) => {
     for ( const entry of compat.failed ) {
         console.warn(`  WARNING: not rewritten: ${entry}`);
     }
+    console.log(`  UXP patches: ${options.patches ? patched.join(', ') : 'not applied (--no-patches)'}`);
+    console.log(`  engine worker: ${ENGINE_WORKER} (${(workerSize / 1024).toFixed(0)} KB)`);
     if ( options.noAssets ) {
         console.log('  filter lists: not bundled (--no-assets)');
     } else {
