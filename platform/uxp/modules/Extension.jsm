@@ -65,7 +65,10 @@ Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
 
 /******************************************************************************/
 
-const PREF_UUID = 'extensions.ublock0.uuid';
+// The runtime's prefs, all under this branch, the admin's managed storage
+// (PREF_MANAGED_STORAGE, api-core.js) among them.
+const PREF_BRANCH = 'extensions.ublock0.';
+const PREF_UUID = `${PREF_BRANCH}uuid`;
 const XUL_NS = 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul';
 const RTL_LANGUAGES = new Set([ 'ar', 'ckb', 'dv', 'fa', 'he', 'ps', 'sd', 'ug', 'ur', 'yi' ]);
 
@@ -141,13 +144,19 @@ MatchPattern.WILDCARD_SCHEMES = new Set([ 'http', 'https', 'ws', 'wss' ]);
 
 /******************************************************************************/
 
-const uuidForExtension = function() {
+// The UUID of this profile's moz-extension origin, or ''.
+const savedUUID = function() {
     let uuid = '';
     try {
         uuid = Services.prefs.getCharPref(PREF_UUID);
     } catch (ex) {
     }
-    if ( /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid) === false ) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid) ? uuid : '';
+};
+
+const uuidForExtension = function() {
+    let uuid = savedUUID();
+    if ( uuid === '' ) {
         uuid = Cc['@mozilla.org/uuid-generator;1']
             .getService(Ci.nsIUUIDGenerator)
             .generateUUID().toString().slice(1, -1);
@@ -486,6 +495,13 @@ const WebAccessiblePolicy = class {
             .generateUUID().toString());
         this.contractID = '@ublock0.uxp/web-accessible-policy;1';
         this.QueryInterface = XPCOMUtils.generateQI([ Ci.nsIContentPolicy, Ci.nsIFactory ]);
+        // Gecko consults the policy for a moment after it is unregistered
+        // (category changes reach the content policy service in a later
+        // task), when bootstrap.js may have unloaded this module, globals
+        // included: what that takes is kept here.
+        this.ACCEPT = Ci.nsIContentPolicy.ACCEPT;
+        this.REJECT = Ci.nsIContentPolicy.REJECT_REQUEST;
+        this.registered = false;
     }
 
     register() {
@@ -496,9 +512,11 @@ const WebAccessiblePolicy = class {
             this
         );
         this.categories.addCategoryEntry('content-policy', this.contractID, this.contractID, false, true);
+        this.registered = true;
     }
 
     unregister() {
+        this.registered = false;
         this.categories.deleteCategoryEntry('content-policy', this.contractID, false);
         this.registrar.unregisterFactory(this.classID, this);
     }
@@ -526,11 +544,12 @@ const WebAccessiblePolicy = class {
 
     // nsIContentPolicy
     shouldLoad(contentType, location, requestOrigin, context, mimeTypeGuess, extra, requestPrincipal) {
-        const { ACCEPT, REJECT_REQUEST } = Ci.nsIContentPolicy;
+        const { ACCEPT, REJECT } = this;
+        if ( this.registered === false ) { return ACCEPT; }
         if ( location.schemeIs('moz-extension') === false ) { return ACCEPT; }
         if ( location.host !== this.extension.uuid ) { return ACCEPT; }
         if ( this.isPrivileged(requestOrigin, requestPrincipal) ) { return ACCEPT; }
-        if ( this.extension.webAccessible.matches(location.spec) === false ) { return REJECT_REQUEST; }
+        if ( this.extension.webAccessible.matches(location.spec) === false ) { return REJECT; }
         // Gecko checks a document load twice, from the docshell and then for
         // the load itself: the listeners see it once (uBO's secrets are
         // single-use).
@@ -543,7 +562,7 @@ const WebAccessiblePolicy = class {
             const cancelled = webRequest.onResourceLoad(
                 contentType, location, requestOrigin, context, requestPrincipal
             );
-            return cancelled ? REJECT_REQUEST : ACCEPT;
+            return cancelled ? REJECT : ACCEPT;
         } catch (ex) {
             Cu.reportError(ex);
         }
@@ -551,7 +570,7 @@ const WebAccessiblePolicy = class {
     }
 
     shouldProcess() {
-        return Ci.nsIContentPolicy.ACCEPT;
+        return this.ACCEPT;
     }
 };
 
@@ -742,6 +761,48 @@ var Extension = class {
 
     onShutdown(callback) {
         this.shutdownCallbacks.push(callback);
+    }
+
+    // The browser quits: the Add-ons Manager stops add-ons after the windows
+    // have closed and before IndexedDB shuts down. Left running, the page
+    // would go on into the profile's shutdown, where its IndexedDB
+    // transactions fail (uBO saving lists it has just downloaded); Firefox
+    // 52 stopped its background pages here too. A transaction still running
+    // is aborted, as a whole. The rest stays as it is: prefs keep their
+    // values across restarts.
+    onAppShutdown() {
+        if ( this.background === null ) { return; }
+        this.background.stop();
+        this.background = null;
+    }
+
+    // The add-on removed (not updated): what it leaves behind goes too, as
+    // with Firefox's WebExtensions -- the data of its moz-extension origin
+    // (uBO's cache, its pages' localStorage), storage.local, its toolbar
+    // button's place, the runtime's prefs with the UUID among them. The
+    // admin's managed storage stays. bootstrap.js calls this whether the
+    // add-on was enabled or not; its privacy settings were restored when it
+    // stopped.
+    static uninstall(data) {
+        const uuid = savedUUID();
+        if ( uuid !== '' ) {
+            const principal = Services.scriptSecurityManager.createCodebasePrincipal(
+                Services.io.newURI(`moz-extension://${uuid}/`, null, null),
+                { addonId: data.id }
+            );
+            Cc['@mozilla.org/dom/quota-manager-service;1']
+                .getService(Ci.nsIQuotaManagerService)
+                .clearStoragesForPrincipal(principal);
+        }
+        Services.obs.notifyObservers(null, 'clear-origin-attributes-data',
+            JSON.stringify({ addonId: data.id })
+        );
+        forgetCoreData(data.id);
+        forgetBrowserUI();
+        for ( const name of Services.prefs.getChildList(PREF_BRANCH, {}) ) {
+            if ( name === PREF_MANAGED_STORAGE ) { continue; }
+            Services.prefs.clearUserPref(name);
+        }
     }
 
     /**************************************************************************/

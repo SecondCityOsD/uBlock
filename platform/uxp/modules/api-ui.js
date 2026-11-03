@@ -32,16 +32,19 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Ci, Cu, Services, dispatch, windowUtilsOf, outerWindowIdOf, logMessage,
+/* global Cc, Ci, Cu, Services, dispatch, windowUtilsOf, outerWindowIdOf, logMessage,
           MatchPattern, EventManager, ExtensionError, apiSync, apiAsync */
-/* exported createUIAPIs */
+/* exported createUIAPIs, forgetBrowserUI */
 
 'use strict';
 
-var { createUIAPIs } = (( ) => {
+var { createUIAPIs, forgetBrowserUI } = (( ) => {
 
 const XUL_NS = 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul';
 const HTML_NS = 'http://www.w3.org/1999/xhtml';
+const BROWSER_URL = 'chrome://browser/content/browser.xul';
+const PALE_MOON_BUTTON_ID = 'uBlock0-legacy-button';
+const BASILISK_BUTTON_ID = 'ublock0-button';
 const PREF_BUTTON_PLACED = 'extensions.ublock0.toolbarButtonPlaced';
 const PREF_SHORTCUTS = 'extensions.ublock0.shortcuts';
 const POPUP_MAX_WIDTH = 800;
@@ -267,7 +270,7 @@ PopupView.EVENTS = [ 'DOMWindowClose', 'DOMContentLoaded', 'load', 'MozScrolledA
 const PaleMoonButton = class {
     constructor(action) {
         this.action = action;
-        this.id = 'uBlock0-legacy-button';
+        this.id = PALE_MOON_BUTTON_ID;
         this.panelId = `${this.id}-panel`;
         this.buttons = new WeakMap();
         this.views = new WeakMap();
@@ -402,7 +405,7 @@ const PaleMoonButton = class {
 const BasiliskButton = class {
     constructor(action) {
         this.action = action;
-        this.id = 'ublock0-button';
+        this.id = BASILISK_BUTTON_ID;
         this.viewId = 'ublock0-panel';
         this.views = new WeakMap();
     }
@@ -1375,6 +1378,40 @@ const createUIAPIs = function(extension) {
 
 /******************************************************************************/
 
-return { createUIAPIs };
+// The add-on removed: its button's place goes too, as when Firefox removes
+// a WebExtension's browserAction. (PREF_BUTTON_PLACED and PREF_SHORTCUTS go
+// with the runtime's other prefs: see Extension.uninstall().)
+const forgetBrowserUI = function() {
+    if ( CustomizableUI !== null ) {
+        CustomizableUI.removeWidgetFromArea(BASILISK_BUTTON_ID);
+        return;
+    }
+    // Pale Moon: the button's ID out of the toolbars' `currentset`, as
+    // persisted for the windows to come and in the open ones.
+    const names = value => value.split(/\s*,\s*/);
+    const without = value => names(value).filter(id => id !== PALE_MOON_BUTTON_ID).join(',');
+    const store = Cc['@mozilla.org/xul/xulstore;1'].getService(Ci.nsIXULStore);
+    const ids = store.getIDsEnumerator(BROWSER_URL);
+    while ( ids.hasMore() ) {
+        const id = ids.getNext();
+        const currentset = store.getValue(BROWSER_URL, id, 'currentset');
+        if ( names(currentset).includes(PALE_MOON_BUTTON_ID) ) {
+            store.setValue(BROWSER_URL, id, 'currentset', without(currentset));
+        }
+    }
+    const windows = Services.wm.getEnumerator('navigator:browser');
+    while ( windows.hasMoreElements() ) {
+        for ( const toolbar of windows.getNext().document.querySelectorAll('toolbar[currentset]') ) {
+            const currentset = toolbar.getAttribute('currentset');
+            if ( names(currentset).includes(PALE_MOON_BUTTON_ID) ) {
+                toolbar.setAttribute('currentset', without(currentset));
+            }
+        }
+    }
+};
+
+/******************************************************************************/
+
+return { createUIAPIs, forgetBrowserUI };
 
 })();

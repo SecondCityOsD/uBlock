@@ -236,7 +236,10 @@ const compileSpec = function(args) {
 // also sees failures and requests the extension cancelled; once the response
 // starts, a stream filter can no longer be attached. After a redirect the
 // wrapper moves to the new channel with the rest of the listener chain: it
-// only reports for its own channel.
+// only reports for its own channel. A request can outlive the extension
+// (a long download): once webRequest has stopped -- and bootstrap.js may
+// have unloaded this module, globals included -- the wrapper only passes
+// everything on.
 
 const TracingListener = class {
     constructor(service, request) {
@@ -245,8 +248,12 @@ const TracingListener = class {
         this.original = null;
     }
 
+    reports(channel) {
+        return channel === this.request.channel && this.service.stopped === false;
+    }
+
     onStartRequest(channel, ...rest) {
-        if ( channel === this.request.channel ) {
+        if ( this.reports(channel) ) {
             this.service.onResponseStarted(this.request);
         }
         this.original.onStartRequest(channel, ...rest);
@@ -260,7 +267,7 @@ const TracingListener = class {
         try {
             this.original.onStopRequest(channel, ...rest);
         } finally {
-            if ( channel === this.request.channel ) {
+            if ( this.reports(channel) ) {
                 this.service.onRequestStopped(this.request, rest[rest.length - 1]);
             }
         }
@@ -285,7 +292,11 @@ TracingListener.prototype.QueryInterface = XPCOMUtils.generateQI([
 // Events fire from the channel's own callbacks rather than from a later
 // task: uBO writes and closes from its onstop handler, so a document gets
 // the end of its data in the same callback in which the channel ends.
+//
+// Once the extension page has gone, a filter only passes everything on,
+// without this module's globals (see TracingListener).
 
+const NS_OK = Cr.NS_OK;
 const FILTER_OPEN = new Set([
     'uninitialized', 'transferringdata', 'finishedtransferringdata', 'suspended',
 ]);
@@ -440,7 +451,7 @@ const StreamFilter = class {
         }
         this.status = 'closed';
         this.resumeChannel();
-        this.stopChain(Cr.NS_OK);
+        this.stopChain(NS_OK);
         this.context.forgetOnUnload(this.onUnload);
     }
 
@@ -476,7 +487,7 @@ const StreamFilter = class {
         this.started = true;
         this.next.onStartRequest(request, ...args);
         if ( this.status === 'closed' ) {
-            this.stopChain(Cr.NS_OK);
+            this.stopChain(NS_OK);
             return;
         }
         if ( this.passThrough ) { return; }
@@ -528,6 +539,7 @@ const WebRequestService = class {
         this.extension = extension;
         this.tracker = extension.tabTracker;
         this.specs = new WeakMap();
+        this.stopped = false;
         this.priming = false;
         this.primed = [];
         this.primingTimer = null;
@@ -548,11 +560,13 @@ const WebRequestService = class {
     }
 
     stop() {
+        this.stopped = true;
         Services.obs.removeObserver(this, MODIFY_TOPIC);
         for ( const topic of EXAMINE_TOPICS ) {
             Services.obs.removeObserver(this, topic);
         }
         this.endPriming();
+        this.live.clear();
     }
 
     startPriming() {

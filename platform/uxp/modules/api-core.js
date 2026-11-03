@@ -24,12 +24,14 @@
 
 /* global Ci, Cu, Services, setTimeout, clearTimeout, indexedDB, dispatch,
           EventManager, ExtensionError, PageValue, apiSync, apiAsync */
-/* exported createCoreAPIs */
+/* exported createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE */
 
 'use strict';
 
-var { createCoreAPIs } = (( ) => {
+var { createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE } = (( ) => {
 
+// Firefox's managed storage (admin settings): JSON in this pref, the
+// admin's, which outlives the add-on.
 const PREF_MANAGED_STORAGE = 'extensions.ublock0.managedStorage';
 const NO_RECEIVER = 'Could not establish connection. Receiving end does not exist.';
 
@@ -300,6 +302,10 @@ const changeOf = (oldValue, newValue) => {
     return change;
 };
 
+// storage.local and storage.sync: one IndexedDB database of the browser's
+// own (chrome) origin per extension.
+const storageDatabaseName = addonId => `uxp-webext-storage:${addonId}`;
+
 const StorageService = class {
     constructor(extension) {
         this.extension = extension;
@@ -316,7 +322,7 @@ const StorageService = class {
 
     database() {
         if ( this.dbPromise === null ) {
-            const request = indexedDB.open(`uxp-webext-storage:${this.extension.id}`, 1);
+            const request = indexedDB.open(storageDatabaseName(this.extension.id), 1);
             request.onupgradeneeded = ( ) => {
                 const db = request.result;
                 for ( const area of [ 'local', 'sync' ] ) {
@@ -723,6 +729,13 @@ const createCoreAPIs = function(extension) {
 
 /******************************************************************************/
 
-return { createCoreAPIs };
+// The add-on removed: its storage.local and storage.sync go too.
+const forgetCoreData = function(addonId) {
+    indexedDB.deleteDatabase(storageDatabaseName(addonId));
+};
+
+/******************************************************************************/
+
+return { createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE };
 
 })();

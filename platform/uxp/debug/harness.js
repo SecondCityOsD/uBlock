@@ -33,6 +33,8 @@
 //                        filtering and replace=, CNAME uncloaking, redirect=
 //                        and web-accessible resources, csp=, permissions=,
 //                        header=, strict blocking, privacy settings
+//             'uninstall' ... remove the add-on, check what it left behind
+//             'uninstall-disabled' ... the same, disabling it first
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -49,6 +51,8 @@ const { Services } = Cu.import('resource://gre/modules/Services.jsm', {});
 const { XPCOMUtils } = Cu.import('resource://gre/modules/XPCOMUtils.jsm', {});
 const { NetUtil } = Cu.import('resource://gre/modules/NetUtil.jsm', {});
 const { setTimeout, clearTimeout } = Cu.import('resource://gre/modules/Timer.jsm', {});
+
+Cu.importGlobalProperties([ 'indexedDB' ]);
 
 const prefs = Services.prefs.getBranch('extensions.ublock0.uxpTest.');
 const appShell = Cc['@mozilla.org/appshell/appShellService;1']
@@ -1896,10 +1900,13 @@ const runFiltering = async function() {
             const page = Cu.waiveXrays(bgWindow);
             const filter = Cu.waiveXrays(page.browser.webRequest.filterResponseData('uxp-no-such-request'));
             report.streamFilterError = await new Promise(resolve => {
+                const timer = setTimeout(( ) => {
+                    resolve({ status: filter.status, error: 'no error event' });
+                }, 5000);
                 filter.onerror = Cu.exportFunction(( ) => {
+                    clearTimeout(timer);
                     resolve({ status: filter.status, error: filter.error });
                 }, page);
-                setTimeout(( ) => { resolve({ status: filter.status, error: 'no error event' }); }, 5000);
             });
         });
 
@@ -2053,6 +2060,161 @@ const runFiltering = async function() {
 
 /******************************************************************************/
 
+// Uninstall: what uBO leaves behind once removed -- as with Firefox's
+// WebExtensions, nothing but the admin's managed storage. The add-on
+// removes itself; this code runs on from its unloaded scope, without the
+// console mirror (bootstrap.js stops the harness).
+
+const UBO_PRIVACY_PREFS = [
+    'network.prefetch-next', 'network.dns.disablePrefetch',
+    'network.http.speculative-parallel-limit', 'network.predictor.enabled',
+    'browser.send_pings',
+];
+
+// Whether the browser's own (chrome) origin has an IndexedDB database of
+// that name. Opening a missing one creates it: it is deleted again.
+// (Aborting its creation instead makes Gecko report an internal error.)
+const databaseExists = name => new Promise(resolve => {
+    let created = false;
+    const request = indexedDB.open(name);
+    request.onupgradeneeded = event => {
+        created = event.oldVersion === 0;
+    };
+    request.onsuccess = ( ) => {
+        request.result.close();
+        if ( created === false ) {
+            resolve(true);
+            return;
+        }
+        const deletion = indexedDB.deleteDatabase(name);
+        deletion.onsuccess = deletion.onerror = ( ) => { resolve(false); };
+    };
+    request.onerror = event => {
+        event.preventDefault();
+        resolve(false);
+    };
+});
+
+// What the add-on keeps in the profile.
+const leftovers = async function(addonId, uuid) {
+    const originStorage = [];
+    const dir = Services.dirsvc.get('ProfD', Ci.nsIFile);
+    dir.append('storage');
+    dir.append('default');
+    if ( dir.exists() ) {
+        const entries = dir.directoryEntries;
+        while ( entries.hasMoreElements() ) {
+            const entry = entries.getNext().QueryInterface(Ci.nsIFile);
+            if ( entry.leafName.startsWith(`moz-extension+++${uuid}`) ) {
+                originStorage.push(entry.leafName);
+            }
+        }
+    }
+    let buttonPlacement = null;
+    try {
+        const { CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {});
+        buttonPlacement = CustomizableUI.getPlacementOfWidget('ublock0-button', false, true);
+    } catch (ex) {
+        const doc = 'chrome://browser/content/browser.xul';
+        const store = Cc['@mozilla.org/xul/xulstore;1'].getService(Ci.nsIXULStore);
+        const ids = store.getIDsEnumerator(doc);
+        while ( ids.hasMore() ) {
+            const id = ids.getNext();
+            if ( store.getValue(doc, id, 'currentset').includes('uBlock0-legacy-button') ) {
+                buttonPlacement = { toolbar: id };
+            }
+        }
+    }
+    return {
+        prefs: Services.prefs.getChildList('extensions.ublock0.', {})
+            .filter(name => Services.prefs.prefHasUserValue(name))
+            .sort(),
+        originStorage,
+        storageLocal: await databaseExists(`uxp-webext-storage:${addonId}`),
+        buttonPlacement,
+        privacyPrefsSet: UBO_PRIVACY_PREFS.filter(name => Services.prefs.prefHasUserValue(name)),
+    };
+};
+
+// disableFirst: removed while disabled, when the runtime is not loaded.
+const runUninstall = async function(disableFirst) {
+    const report = {};
+    const checks = {};
+    let failure = null;
+    try {
+        const { ext } = await whenUBOReady();
+        const { id, uuid } = ext;
+        await sleep(2000);
+        report.before = await leftovers(id, uuid);
+        const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+        const addon = await new Promise(resolve => { AddonManager.getAddonByID(id, resolve); });
+        const uninstallStarted = Date.now();
+        if ( disableFirst ) {
+            addon.userDisabled = true;
+            await sleep(1000);
+            report.afterDisable = await leftovers(id, uuid);
+        }
+        addon.uninstall();
+        // QuotaManager clears the origin's storage asynchronously.
+        const deadline = Date.now() + 10000;
+        do {
+            await sleep(500);
+            report.after = await leftovers(id, uuid);
+        } while ( report.after.originStorage.length !== 0 && Date.now() < deadline );
+        report.addonGone = await new Promise(resolve => {
+            AddonManager.getAddonByID(id, found => { resolve(found === null); });
+        });
+        report.errorsDuringUninstall = (Services.console.getMessageArray() || [])
+            .filter(m => m instanceof Ci.nsIScriptError && m.timeStamp >= uninstallStarted &&
+                (m.flags & Ci.nsIScriptError.warningFlag) === 0)
+            .map(m => `+${m.timeStamp - uninstallStarted} ms [${m.category}, window ${m.innerWindowID}] ` +
+                `${m.errorMessage} @ ${m.sourceName}:${m.lineNumber}`);
+    } catch (ex) {
+        failure = String(ex);
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { before = {}, after = {} } = report;
+    checks.somethingToRemove = pass(
+        (before.prefs || []).includes('extensions.ublock0.uuid') &&
+        (before.originStorage || []).length !== 0 &&
+        before.storageLocal === true && before.buttonPlacement !== null,
+        before);
+    // As in Firefox: disabled, the data stays; the privacy prefs are the
+    // user's again.
+    if ( disableFirst ) {
+        const disabled = report.afterDisable || {};
+        checks.disableKeepsData = pass(
+            (disabled.prefs || []).includes('extensions.ublock0.uuid') &&
+            (disabled.originStorage || []).length !== 0 && disabled.storageLocal === true &&
+            Array.isArray(disabled.privacyPrefsSet) && disabled.privacyPrefsSet.length === 0,
+            disabled);
+    }
+    checks.addonRemoved = pass(report.addonGone === true, report.addonGone);
+    checks.prefs = pass(
+        JSON.stringify(after.prefs) === JSON.stringify([ 'extensions.ublock0.managedStorage' ]),
+        after.prefs);
+    checks.originStorage = pass(Array.isArray(after.originStorage) && after.originStorage.length === 0, after.originStorage);
+    checks.storageLocal = pass(after.storageLocal === false, after.storageLocal);
+    checks.buttonPlacement = pass(after.buttonPlacement === null, after.buttonPlacement);
+    checks.privacyPrefs = pass(Array.isArray(after.privacyPrefsSet) && after.privacyPrefsSet.length === 0, after.privacyPrefsSet);
+    checks.noErrors = pass(Array.isArray(report.errorsDuringUninstall) && report.errorsDuringUninstall.length === 0,
+        report.errorsDuringUninstall);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        before,
+        afterDisable: report.afterDisable,
+        after,
+        errorsDuringUninstall: report.errorsDuringUninstall,
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -2077,6 +2239,8 @@ const scenarios = {
     cosmetic: runCosmetic,
     ui: runUI,
     filtering: runFiltering,
+    uninstall: ( ) => runUninstall(false),
+    'uninstall-disabled': ( ) => runUninstall(true),
 };
 
 // Filters and user settings given to uBO through managed storage.
@@ -2098,6 +2262,9 @@ const SCENARIO_HOSTS = {
 
 const runScenario = async function(name) {
     const started = Date.now();
+    // Read now: the uninstall scenario removes uBO's prefs, these included.
+    const linger = getPref('lingerSeconds', 0);
+    const autoQuit = getPref('autoQuit', false);
     log(`scenario "${name}": waiting for the browser window`);
     await whenBrowserReady();
     log(`scenario "${name}": running`);
@@ -2115,7 +2282,6 @@ const runScenario = async function(name) {
     result.elapsedMs = Date.now() - started;
     // Keep the browser open a while longer, e.g. to let uBO write its
     // selfie (53 s after boot) before quitting.
-    const linger = getPref('lingerSeconds', 0);
     if ( linger > 0 ) {
         log(`scenario "${name}": lingering ${linger} s`);
         await sleep(linger * 1000);
@@ -2123,7 +2289,7 @@ const runScenario = async function(name) {
     writeText(`${name}.json`, JSON.stringify(result, null, 2));
     writeText('done', name);
     log(`scenario "${name}": done`);
-    if ( getPref('autoQuit', false) ) {
+    if ( autoQuit ) {
         Services.startup.quit(Ci.nsIAppStartup.eForceQuit);
     }
 };

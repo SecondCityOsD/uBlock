@@ -92,7 +92,12 @@ function startup(data, reason) {
 }
 
 function shutdown(data, reason) {
-    if ( reason === APP_SHUTDOWN ) { return; }
+    // The browser quits: only the background page stops (see
+    // Extension.onAppShutdown()).
+    if ( reason === APP_SHUTDOWN ) {
+        if ( extension !== null ) { extension.onAppShutdown(); }
+        return;
+    }
     stopExtension();
     Cu.unload(RUNTIME_URL);
     if ( harness !== null ) {
@@ -104,5 +109,19 @@ function shutdown(data, reason) {
 function install() {
 }
 
-function uninstall() {
+// Removed, not updated: the runtime cleans up after the extension (see
+// Extension.uninstall()). The add-on's chrome package is only registered
+// while it runs, and it may not be running now.
+function uninstall(data, reason) {
+    if ( reason !== ADDON_UNINSTALL ) { return; }
+    Components.manager.addBootstrappedManifestLocation(data.installPath);
+    try {
+        const { Extension } = Cu.import(RUNTIME_URL, {});
+        Extension.uninstall(data);
+    } catch (ex) {
+        Cu.reportError(ex);
+    } finally {
+        Cu.unload(RUNTIME_URL);
+        Components.manager.removeBootstrappedManifestLocation(data.installPath);
+    }
 }
