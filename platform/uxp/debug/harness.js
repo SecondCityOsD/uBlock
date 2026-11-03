@@ -38,6 +38,9 @@
 //             'update'   ... check what this browser's update checker makes
 //                        of the release's update manifest
 //                        (updateManifest, updateExpected)
+//             'stop-busy' ... disable the add-on while pages load, while
+//                        it boots and while it filters; re-enable it
+//                        (keepConsoleLog: the next instance appends)
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -957,21 +960,22 @@ const TestServer = class {
                     input.asyncWait(reader, 0, 0, Services.tm.mainThread);
                     return;
                 }
-                this.respond(received, output);
-                input.close();
+                this.respond(received, input, output);
             },
         };
         input.asyncWait(reader, 0, 0, Services.tm.mainThread);
     }
 
-    respond(request, output) {
+    // A route may answer late (delayMs), or send the first half of its body
+    // and the rest splitDelayMs later: requests and streams in flight.
+    respond(request, input, output) {
         const path = request.split('\r\n', 1)[0].split(' ')[1] || '/';
         const host = (/^host:\s*(\S+)/im.exec(request) || [ '', '' ])[1];
         this.requests.push(`${host.replace(/:\d+$/, '')}${path}`);
         const route = this.routes(path.replace(/\?.*$/, ''), this.port);
         // A body is a binary string: one character per byte.
         const body = route !== null ? route.body : 'not found';
-        const response = [
+        const head = [
             `HTTP/1.1 ${route !== null ? '200 OK' : '404 Not Found'}`,
             `Content-Type: ${route !== null ? route.type : 'text/plain'}`,
             `Content-Length: ${body.length}`,
@@ -979,10 +983,32 @@ const TestServer = class {
             'Connection: close',
             ...(route !== null && route.headers || []),
             '',
-            body,
+            '',
         ].join('\r\n');
-        output.write(response, response.length);
-        output.close();
+        const send = text => { output.write(text, text.length); };
+        const end = ( ) => {
+            output.close();
+            input.close();
+        };
+        const { delayMs = 0, splitDelayMs = 0 } = route || {};
+        const answer = ( ) => {
+            if ( splitDelayMs === 0 ) {
+                send(head + body);
+                end();
+                return;
+            }
+            const half = body.length >> 1;
+            send(head + body.slice(0, half));
+            setTimeout(( ) => {
+                send(body.slice(half));
+                end();
+            }, splitDelayMs);
+        };
+        if ( delayMs === 0 ) {
+            answer();
+        } else {
+            setTimeout(answer, delayMs);
+        }
     }
 };
 
@@ -2304,6 +2330,200 @@ const runUpdate = async function() {
 
 /******************************************************************************/
 
+// Stop while busy: uBO disabled while a page loads, once while it boots
+// (the runtime holds the page's requests for uBO's answer), once while it
+// filters (its HTML filter reading the page's document, half arrived). The
+// pages must still finish, whole, the runtime must log nothing once
+// stopped, and uBO must block again once re-enabled. The add-on that comes
+// back runs no scenario: this harness drives on to the end.
+
+const STOP_HOST = 'uxp-stop.test';
+const STOP_FILTERS = [
+    `||${STOP_HOST}^*/uxp-blocked/`,
+    `${STOP_HOST}##^#uxp-stop-removed`,
+];
+const RUNTIME_SOURCE = /^chrome:\/\/ublock0\/content\/uxp\/|\/bootstrap\.js$/;
+const UBO_SOURCE = /^moz-extension:\/\//;
+
+const stopRoutes = function(path) {
+    const svg = color => ({
+        type: 'image/svg+xml',
+        body: `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="${color}"/></svg>`,
+    });
+    switch ( path ) {
+    // Its two halves arrive 3 s apart; its slow image and XHR, 3 s late.
+    case '/busy.html':
+        return {
+            type: 'text/html; charset=utf-8',
+            body: `<!doctype html><html><head><meta charset="utf-8"><title>busy</title></head><body>
+<img id="okImage" src="/ok/image.svg"><img id="adImage" src="/uxp-blocked/ad.svg"><img id="slowImage" src="/slow/image.svg">
+<div id="uxp-stop-removed">removed by an HTML filter</div>
+<script>${recorderScript(`
+const xhr = new XMLHttpRequest();
+xhr.open('GET', '/slow/xhr.txt');
+xhr.onload = ( ) => { results.slowXHR = xhr.status; save(); };
+xhr.onerror = ( ) => { results.slowXHR = 'error'; save(); };
+xhr.send();`)}</script>
+<p id="filler">${'uxp '.repeat(8192)}</p><p id="tail">end</p></body></html>`,
+            splitDelayMs: 3000,
+        };
+    case '/probe.html':
+        return {
+            type: 'text/html; charset=utf-8',
+            body: `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<img id="okImage" src="/ok/probe.svg"><img id="adImage" src="/uxp-blocked/probe.svg">
+<script>${recorderScript('')}</script></body></html>`,
+        };
+    case '/ok/image.svg':
+    case '/ok/probe.svg':
+        return svg('green');
+    case '/uxp-blocked/ad.svg':
+    case '/uxp-blocked/probe.svg':
+        return svg('red');
+    case '/slow/image.svg':
+        return { ...svg('blue'), delayMs: 3000 };
+    case '/slow/xhr.txt':
+        return { type: 'text/plain', body: 'slow', delayMs: 3000 };
+    default:
+        return null;
+    }
+};
+
+// Errors logged since `since` by the runtime, and by uBO's own pages.
+const errorsSince = function(since) {
+    const out = { runtime: [], ubo: [] };
+    for ( const m of Services.console.getMessageArray() || [] ) {
+        if ( m instanceof Ci.nsIScriptError === false ) { continue; }
+        if ( m.timeStamp < since || (m.flags & Ci.nsIScriptError.warningFlag) !== 0 ) { continue; }
+        const text = `+${m.timeStamp - since} ms ${m.errorMessage} @ ${m.sourceName}:${m.lineNumber}`;
+        if ( RUNTIME_SOURCE.test(m.sourceName) ) {
+            out.runtime.push(text);
+        } else if ( UBO_SOURCE.test(m.sourceName) ) {
+            out.ubo.push(text);
+        }
+    }
+    return out;
+};
+
+// A tab's test document once loaded, all its resources settled.
+const finishedPage = async function(tab, timeout) {
+    const doc = await waitFor(( ) => {
+        const d = tab.linkedBrowser.contentDocument;
+        return d && d.documentURI.startsWith('http') && d.readyState === 'complete' ? d : null;
+    }, timeout, 'the page to finish loading').catch(( ) => null);
+    if ( doc === null ) { return { finished: false }; }
+    const results = ( ) => doc.body && doc.body.dataset.results ? JSON.parse(doc.body.dataset.results) : {};
+    if ( doc.getElementById('slowImage') !== null ) {
+        await waitFor(( ) => results().slowXHR !== undefined, 5000, 'the slow XHR').catch(( ) => null);
+    }
+    return {
+        finished: true,
+        whole: doc.getElementById('okImage') !== null &&
+            (doc.getElementById('filler') === null || doc.getElementById('tail') !== null),
+        htmlFiltered: doc.getElementById('slowImage') !== null && doc.getElementById('uxp-stop-removed') === null,
+        results: results(),
+    };
+};
+
+// Whether the add-on that came back blocks: probe pages until one loads
+// without its blocked image ever reaching the server.
+const probeBlocking = async function(win, server, timeout) {
+    const started = Date.now();
+    const adRequests = ( ) => server.requests.filter(r => r.endsWith('/uxp-blocked/probe.svg')).length;
+    for ( let attempt = 1; Date.now() - started < timeout; attempt++ ) {
+        const before = adRequests();
+        const tab = win.gBrowser.addTab(`http://${STOP_HOST}:${server.port}/probe.html?n=${attempt}`);
+        const page = await finishedPage(tab, Math.max(timeout - (Date.now() - started), 1000));
+        win.gBrowser.removeTab(tab);
+        if ( page.finished && adRequests() === before ) {
+            return { blocked: true, afterMs: Date.now() - started, attempts: attempt };
+        }
+        await sleep(2000);
+    }
+    return { blocked: false, afterMs: Date.now() - started, leaked: adRequests() };
+};
+
+const runStopBusy = async function() {
+    const report = {};
+    const checks = {};
+    let failure = null;
+    const server = new TestServer(stopRoutes);
+    server.start();
+    try {
+        const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+        const addon = await new Promise(resolve => { AddonManager.getAddonByID(addonData.id, resolve); });
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const busyURL = n => `http://${STOP_HOST}:${server.port}/busy.html?n=${n}`;
+        // The add-on that comes back: no scenario of its own, the same log.
+        prefs.setCharPref('scenario', '');
+        prefs.setBoolPref('keepConsoleLog', true);
+
+        // Stopped while booting: uBO holds the page's requests.
+        const ext = await waitFor(( ) => extension, 30000, 'the extension');
+        const tab1 = win.gBrowser.addTab(busyURL(1));
+        await sleep(2000);
+        report.booting = {};
+        try {
+            report.booting.uboWasReady = Cu.waiveXrays(ext.background.window).µBlock.readyToFilter === true;
+        } catch {
+            report.booting.uboWasReady = false;
+        }
+        let stoppedAt = Date.now();
+        addon.userDisabled = true;
+        report.booting.page = await finishedPage(tab1, 20000);
+        await sleep(2000);
+        report.booting.errors = errorsSince(stoppedAt);
+        win.gBrowser.removeTab(tab1);
+
+        addon.userDisabled = false;
+        report.restart1 = await probeBlocking(win, server, 90000);
+
+        // Stopped while filtering: the document half read by uBO's HTML
+        // filter, an image and an XHR in flight.
+        const tab2 = win.gBrowser.addTab(busyURL(2));
+        await sleep(1500);
+        stoppedAt = Date.now();
+        addon.userDisabled = true;
+        report.filtering = { page: await finishedPage(tab2, 20000) };
+        await sleep(2000);
+        report.filtering.errors = errorsSince(stoppedAt);
+        win.gBrowser.removeTab(tab2);
+
+        addon.userDisabled = false;
+        report.restart2 = await probeBlocking(win, server, 90000);
+    } catch (ex) {
+        failure = String(ex);
+    } finally {
+        server.stop();
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { booting = {}, filtering = {}, restart1 = {}, restart2 = {} } = report;
+    const page1 = booting.page || {}, page2 = filtering.page || {};
+    checks.bootingWasBooting = pass(booting.uboWasReady === false, booting.uboWasReady);
+    checks.bootingPageFinished = pass(page1.finished === true && page1.whole === true, page1);
+    checks.bootingNoRuntimeErrors = pass(booting.errors !== undefined && booting.errors.runtime.length === 0,
+        booting.errors && booting.errors.runtime);
+    checks.restart1Blocks = pass(restart1.blocked === true, restart1);
+    checks.filteringPageFinished = pass(page2.finished === true && page2.whole === true, page2);
+    checks.filteringNoRuntimeErrors = pass(filtering.errors !== undefined && filtering.errors.runtime.length === 0,
+        filtering.errors && filtering.errors.runtime);
+    checks.restart2Blocks = pass(restart2.blocked === true, restart2);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        booting,
+        restart1,
+        filtering,
+        restart2,
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -2331,6 +2551,7 @@ const scenarios = {
     uninstall: ( ) => runUninstall(false),
     'uninstall-disabled': ( ) => runUninstall(true),
     update: runUpdate,
+    'stop-busy': runStopBusy,
 };
 
 // Filters and user settings given to uBO through managed storage.
@@ -2339,6 +2560,7 @@ const SCENARIO_FILTERS = {
     cosmetic: COSMETIC_FILTERS,
     ui: UI_FILTERS,
     filtering: FILTERING_FILTERS,
+    'stop-busy': STOP_FILTERS,
 };
 const SCENARIO_USER_SETTINGS = {
     filtering: FILTERING_USER_SETTINGS,
@@ -2348,6 +2570,7 @@ const SCENARIO_USER_SETTINGS = {
 const SCENARIO_HOSTS = {
     cosmetic: COSMETIC_HOST,
     filtering: FILTERING_HOST,
+    'stop-busy': STOP_HOST,
 };
 
 const runScenario = async function(name) {
@@ -2393,12 +2616,16 @@ const start = function(data, reason) {
     if ( outDir.exists() === false ) {
         outDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
     }
-    writeText('console.log', '');
-    record('harness', '--- console messages logged before the add-on started ---');
-    for ( const message of Services.console.getMessageArray() || [] ) {
-        recordConsoleMessage(message, false);
+    // A scenario that re-enables the add-on (stop-busy) keeps the log of the
+    // instance it replaces.
+    if ( getPref('keepConsoleLog', false) === false ) {
+        writeText('console.log', '');
+        record('harness', '--- console messages logged before the add-on started ---');
+        for ( const message of Services.console.getMessageArray() || [] ) {
+            recordConsoleMessage(message, false);
+        }
+        record('harness', '--- end of earlier messages ---');
     }
-    record('harness', '--- end of earlier messages ---');
     Services.console.registerListener(consoleListener);
     Services.obs.addObserver(consoleAPIObserver, 'console-api-log-event', false);
     log(`started: ${data.id} ${data.version} (reason ${reason})`);
