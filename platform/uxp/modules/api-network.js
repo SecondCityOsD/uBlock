@@ -24,7 +24,7 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Cc, Ci, Cu, Services, XPCOMUtils, errorNameOf, EventManager,
+/* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, errorNameOf, EventManager,
           ExtensionError, apiAsync */
 /* exported createNetworkAPIs */
 
@@ -56,48 +56,73 @@ const DNS_FLAGS = {
 const dnsService = Cc['@mozilla.org/network/dns-service;1']
     .getService(Ci.nsIDNSService);
 
-// Firefox's DNSRecord: { addresses, canonicalName (if asked for), isTRR }.
-// Failures reject with the error's name, e.g. NS_ERROR_UNKNOWN_HOST.
-const resolveHostname = function(hostname, flags) {
-    if ( typeof hostname !== 'string' || hostname === '' ) {
-        throw new ExtensionError('dns.resolve: hostname must be a non-empty string');
+// dns.resolve(), resolving to Firefox's DNSRecord: { addresses,
+// canonicalName (if asked for), isTRR }. Failures reject with the error's
+// name, e.g. NS_ERROR_UNKNOWN_HOST.
+//
+// Gecko completes every lookup it started, including after the extension
+// stopped, when the runtime may be unloaded (Cu.unload() empties this
+// global): a lookup then ends before its listener touches anything but
+// its own resolver.
+const DNSResolver = class {
+    constructor() {
+        this.pending = new Set();
+        this.stopped = false;
     }
-    let mask = 0;
-    for ( const flag of flags === undefined || flags === null ? [] : [].concat(flags) ) {
-        if ( hasOwn(DNS_FLAGS, flag) === false ) {
-            throw new ExtensionError(`dns.resolve: invalid flag ${JSON.stringify(flag)}`);
+
+    resolve(hostname, flags) {
+        if ( typeof hostname !== 'string' || hostname === '' ) {
+            throw new ExtensionError('dns.resolve: hostname must be a non-empty string');
         }
-        mask |= Ci.nsIDNSService[DNS_FLAGS[flag]] || 0;
-    }
-    const wantsCanonicalName = (mask & Ci.nsIDNSService.RESOLVE_CANONICAL_NAME) !== 0;
-    return new Promise((resolve, reject) => {
-        const listener = {
-            onLookupComplete(request, record, status) {
-                if ( Components.isSuccessCode(status) === false ) {
-                    reject(new ExtensionError(errorNameOf(status)));
-                    return;
-                }
-                const out = { addresses: [], isTRR: false };
-                if ( wantsCanonicalName ) {
-                    try {
-                        out.canonicalName = record.canonicalName;
-                    } catch {
+        let mask = 0;
+        for ( const flag of flags === undefined || flags === null ? [] : [].concat(flags) ) {
+            if ( hasOwn(DNS_FLAGS, flag) === false ) {
+                throw new ExtensionError(`dns.resolve: invalid flag ${JSON.stringify(flag)}`);
+            }
+            mask |= Ci.nsIDNSService[DNS_FLAGS[flag]] || 0;
+        }
+        const wantsCanonicalName = (mask & Ci.nsIDNSService.RESOLVE_CANONICAL_NAME) !== 0;
+        return new Promise((resolve, reject) => {
+            let lookup = null;
+            const listener = {
+                onLookupComplete: (request, record, status) => {
+                    if ( this.stopped ) { return; }
+                    this.pending.delete(lookup);
+                    if ( Components.isSuccessCode(status) === false ) {
+                        reject(new ExtensionError(errorNameOf(status)));
+                        return;
                     }
-                }
-                while ( record.hasMore() ) {
-                    out.addresses.push(record.getNextAddrAsString());
-                }
-                resolve(out);
-            },
-            QueryInterface: XPCOMUtils.generateQI([ Ci.nsIDNSListener ]),
-        };
-        try {
-            // The listener runs on the main thread, not the resolver's.
-            dnsService.asyncResolve(hostname, mask, listener, Services.tm.mainThread);
-        } catch (ex) {
-            reject(new ExtensionError(ex.result ? errorNameOf(ex.result) : String(ex)));
+                    const out = { addresses: [], isTRR: false };
+                    if ( wantsCanonicalName ) {
+                        try {
+                            out.canonicalName = record.canonicalName;
+                        } catch {
+                        }
+                    }
+                    while ( record.hasMore() ) {
+                        out.addresses.push(record.getNextAddrAsString());
+                    }
+                    resolve(out);
+                },
+                QueryInterface: XPCOMUtils.generateQI([ Ci.nsIDNSListener ]),
+            };
+            try {
+                // The listener runs on the main thread, not the resolver's.
+                lookup = dnsService.asyncResolve(hostname, mask, listener, Services.tm.mainThread);
+                this.pending.add(lookup);
+            } catch (ex) {
+                reject(new ExtensionError(ex.result ? errorNameOf(ex.result) : String(ex)));
+            }
+        });
+    }
+
+    stop() {
+        this.stopped = true;
+        for ( const lookup of this.pending ) {
+            lookup.cancel(Cr.NS_ERROR_ABORT);
         }
-    });
+        this.pending.clear();
+    }
 };
 
 /******************************************************************************/
@@ -392,13 +417,17 @@ const PrivacySettings = class {
 /******************************************************************************/
 
 const createNetworkAPIs = function(extension) {
+    const dns = new DNSResolver();
     const privacy = new PrivacySettings();
     privacy.applyAll();
-    extension.onShutdown(( ) => { privacy.restoreAll(); });
+    extension.onShutdown(( ) => {
+        dns.stop();
+        privacy.restoreAll();
+    });
 
     const tree = {
         dns: {
-            resolve: apiAsync((context, hostname, flags) => resolveHostname(hostname, flags)),
+            resolve: apiAsync((context, hostname, flags) => dns.resolve(hostname, flags)),
         },
         privacy: privacy.namespace(),
     };

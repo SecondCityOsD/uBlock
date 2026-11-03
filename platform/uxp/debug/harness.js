@@ -35,6 +35,9 @@
 //                        header=, strict blocking, privacy settings
 //             'uninstall' ... remove the add-on, check what it left behind
 //             'uninstall-disabled' ... the same, disabling it first
+//             'update'   ... check what this browser's update checker makes
+//                        of the release's update manifest
+//                        (updateManifest, updateExpected)
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -124,6 +127,20 @@ const writeText = function(name, text, append = false) {
     converter.init(stream, 'UTF-8', 0, 0);
     converter.writeString(text);
     converter.close();
+};
+
+// A local file's bytes, as a binary string (a TestServer body).
+const readBytes = function(filePath) {
+    const file = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsIFile);
+    file.initWithPath(filePath);
+    const stream = Cc['@mozilla.org/network/file-input-stream;1']
+        .createInstance(Ci.nsIFileInputStream);
+    stream.init(file, 0x01, 0, 0); // PR_RDONLY
+    try {
+        return NetUtil.readInputStreamToString(stream, stream.available());
+    } finally {
+        stream.close();
+    }
 };
 
 /******************************************************************************/
@@ -2222,6 +2239,71 @@ const runUninstall = async function(disableFirst) {
 
 /******************************************************************************/
 
+// The release's update manifest (tools/make-uxp.mjs writes it), read by this
+// browser's own update checker as if from GitHub: what it offers here.
+const runUpdate = async function() {
+    const report = {};
+    const checks = {};
+    let failure = null;
+    const expected = JSON.parse(getPref('updateExpected', '{}'));
+    let manifest = '';
+    const server = new TestServer(path =>
+        path === '/update.rdf' ? { type: 'text/xml', body: manifest } : null
+    );
+    try {
+        const { ext } = await whenUBOReady();
+        manifest = readBytes(getPref('updateManifest', ''));
+        server.start();
+        const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+        const { AddonUpdateChecker } = Cu.import('resource://gre/modules/addons/AddonUpdateChecker.jsm', {});
+        const updates = await new Promise((resolve, reject) => {
+            AddonUpdateChecker.checkForUpdates(ext.id, null, `http://127.0.0.1:${server.port}/update.rdf`, {
+                onUpdateCheckComplete: resolve,
+                onUpdateCheckError: status => { reject(new Error(`update check error ${status}`)); },
+            });
+        });
+        const describe = update => ({
+            version: update.version,
+            updateURL: update.updateURL || null,
+            updateHash: update.updateHash || null,
+            apps: Array.from(update.targetApplications, app => `${app.id} ${app.minVersion} - ${app.maxVersion}`),
+        });
+        report.updates = Array.from(updates, describe);
+        const offered = AddonUpdateChecker.getNewestCompatibleUpdate(updates);
+        report.offered = offered ? describe(offered) : null;
+        const addon = await new Promise(resolve => { AddonManager.getAddonByID(ext.id, resolve); });
+        report.installed = { version: addon.version, updateURL: addon.updateURL || null };
+    } catch (ex) {
+        failure = String(ex);
+    } finally {
+        server.stop();
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { updates = [], offered = null, installed = {} } = report;
+    checks.parsed = pass(updates.length !== 0 && updates.every(u => u.version === expected.version), updates);
+    checks.offered = pass(offered !== null && offered.version === expected.version, offered);
+    // The release's own asset, under the tag of its version.
+    const link = offered !== null ? offered.updateURL : null;
+    checks.downloadLink = pass(link !== null && link.startsWith('https://github.com/') &&
+        link.endsWith(`/releases/download/${expected.version}/${expected.file}`), link);
+    const hash = offered !== null ? offered.updateHash : null;
+    checks.hash = pass(hash === expected.hash, hash);
+    checks.debugBuildNeverUpdates = pass(installed.updateURL === null, installed);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        offered,
+        installed,
+        updates,
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -2248,6 +2330,7 @@ const scenarios = {
     filtering: runFiltering,
     uninstall: ( ) => runUninstall(false),
     'uninstall-disabled': ( ) => runUninstall(true),
+    update: runUpdate,
 };
 
 // Filters and user settings given to uBO through managed storage.

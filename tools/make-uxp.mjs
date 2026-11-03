@@ -27,11 +27,15 @@
 //   tools/copy-common-files.sh, tools/make-firefox.sh,
 //   tools/make-firefox-meta.py, tools/make-assets.sh
 //
+// A release build also writes dist/update.rdf, the update manifest that
+// offers it (PLAN.md, "Releasing").
+//
 // Usage: node tools/make-uxp.mjs [--debug] [--no-assets] [--refresh-assets]
 //   --debug           include the test harness (platform/uxp/debug/)
 //   --no-assets       don't bundle filter lists (uBO fetches them at runtime)
 //   --refresh-assets  re-download the bundled filter lists
 
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -59,6 +63,16 @@ const TARGET_APPLICATIONS = [
         basilisk: true,
     },
 ];
+
+// Releases are published on GitHub: the update manifest is served from the
+// release branch, each XPI is an asset of the GitHub release tagged with its
+// em:version. The legacy 1.16 fork's installs check the same manifest.
+const REPOSITORY = 'SecondCityOsD/uBlock';
+const RELEASE_BRANCH = 'main';
+const HOMEPAGE_URL = `https://github.com/${REPOSITORY}`;
+const UPDATE_URL = `https://raw.githubusercontent.com/${REPOSITORY}/${RELEASE_BRANCH}/update.rdf`;
+const releaseAssetURL = (emVersion, file) =>
+    `https://github.com/${REPOSITORY}/releases/download/${emVersion}/${file}`;
 
 // Filter lists shipped in the package so a fresh install filters before its
 // first list update. Same set as upstream's tools/make-assets.sh.
@@ -227,7 +241,10 @@ const writeInstallRdf = (des, manifest, emVersion, options) => {
         `    <em:name>${escapeXML(name)}</em:name>`,
         `    <em:description>${escapeXML(description)}</em:description>`,
         `    <em:creator>${escapeXML(manifest.author)}</em:creator>`,
-        '    <em:homepageURL>https://github.com/gorhill/uBlock</em:homepageURL>',
+        `    <em:homepageURL>${HOMEPAGE_URL}</em:homepageURL>`,
+        // Debug builds never update themselves: a test runs the build under
+        // test, and only that.
+        ...(options.debug ? [] : [ `    <em:updateURL>${UPDATE_URL}</em:updateURL>` ]),
         '    <em:bootstrap>true</em:bootstrap>',
         '    <em:multiprocessCompatible>true</em:multiprocessCompatible>',
         ...targets,
@@ -236,6 +253,44 @@ const writeInstallRdf = (des, manifest, emVersion, options) => {
         '',
     ].join('\n');
     fs.writeFileSync(path.join(des, 'install.rdf'), rdf);
+};
+
+// The update manifest offering the release XPI at xpiPath to the browsers
+// it targets. The browser checks the downloaded XPI against its hash.
+const writeUpdateRdf = (file, addonId, emVersion, xpiPath) => {
+    const hash = createHash('sha256').update(fs.readFileSync(xpiPath)).digest('hex');
+    const link = releaseAssetURL(emVersion, path.basename(xpiPath));
+    const targets = TARGET_APPLICATIONS.map(app => [
+        '            <em:targetApplication>',
+        '              <Description>',
+        `                <em:id>${app.id}</em:id>`,
+        `                <em:minVersion>${app.minVersion}</em:minVersion>`,
+        `                <em:maxVersion>${app.maxVersion}</em:maxVersion>`,
+        `                <em:updateLink>${escapeXML(link)}</em:updateLink>`,
+        `                <em:updateHash>sha256:${hash}</em:updateHash>`,
+        '              </Description>',
+        '            </em:targetApplication>',
+    ].join('\n'));
+    const rdf = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<RDF xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"',
+        '     xmlns:em="http://www.mozilla.org/2004/em-rdf#">',
+        `  <Description about="urn:mozilla:extension:${escapeXML(addonId)}">`,
+        '    <em:updates>',
+        '      <Seq>',
+        '        <li>',
+        '          <Description>',
+        `            <em:version>${emVersion}</em:version>`,
+        ...targets,
+        '          </Description>',
+        '        </li>',
+        '      </Seq>',
+        '    </em:updates>',
+        '  </Description>',
+        '</RDF>',
+        '',
+    ].join('\n');
+    fs.writeFileSync(file, rdf);
 };
 
 const writeChromeManifest = des => {
@@ -358,6 +413,11 @@ const main = async ( ) => {
         for ( const entry of assets.missing ) {
             console.warn(`  WARNING: not bundled: ${entry}`);
         }
+    }
+    if ( options.debug === false ) {
+        const updateRdf = path.join(DIST, 'update.rdf');
+        writeUpdateRdf(updateRdf, manifest.browser_specific_settings.gecko.id, emVersion, xpiPath);
+        console.log(`  update manifest: ${path.relative(ROOT, updateRdf)}, for ${UPDATE_URL}`);
     }
 };
 

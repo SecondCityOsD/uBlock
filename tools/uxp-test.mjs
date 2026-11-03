@@ -32,6 +32,7 @@
 // can be overridden with UXP_PALEMOON / UXP_BASILISK.
 
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -126,6 +127,25 @@ const latestDebugXPI = function() {
         .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
 };
 
+// The `update` scenario checks the update manifest a release build
+// (make-uxp.mjs without --debug) wrote next to its XPI, for the release of
+// the version under test. The XPI's hash is computed here, independently.
+const updateScenarioPrefs = function(xpi) {
+    const match = /^uBlock0_(.+)\.uxp-debug\.xpi$/.exec(path.basename(xpi));
+    const version = match !== null ? match[1] : null;
+    const file = `uBlock0_${version}.uxp.xpi`;
+    const release = path.join(DIST, file);
+    const manifest = path.join(DIST, 'update.rdf');
+    if ( version === null || fs.existsSync(release) === false || fs.existsSync(manifest) === false ) {
+        throw new Error(`no release build for ${path.basename(xpi)} in dist/ -- run: node tools/make-uxp.mjs`);
+    }
+    const hash = createHash('sha256').update(fs.readFileSync(release)).digest('hex');
+    return {
+        'extensions.ublock0.uxpTest.updateManifest': manifest,
+        'extensions.ublock0.uxpTest.updateExpected': JSON.stringify({ version, file, hash: `sha256:${hash}` }),
+    };
+};
+
 const writeUserJS = function(profileDir, prefs) {
     const lines = Object.entries(prefs).map(([ name, value ]) =>
         `user_pref(${JSON.stringify(name)}, ${JSON.stringify(value)});`
@@ -142,6 +162,7 @@ const prepareProfile = function(key, xpi, options) {
     fs.rmSync(path.join(profileDir, 'uxp-test'), { recursive: true, force: true });
     writeUserJS(profileDir, {
         ...BASE_PREFS,
+        ...options.scenarioPrefs,
         'extensions.ublock0.uxpTest.scenario': options.scenario,
         'extensions.ublock0.uxpTest.autoQuit': true,
     });
@@ -266,6 +287,7 @@ const runBrowser = async function(key, xpi, options) {
 const main = async ( ) => {
     const options = parseArgs();
     const xpi = options.xpi || latestDebugXPI();
+    options.scenarioPrefs = options.scenario === 'update' ? updateScenarioPrefs(xpi) : {};
     const keys = options.browser === 'all' ? Object.keys(BROWSERS) : [ options.browser ];
     for ( const key of keys ) {
         if ( BROWSERS[key] === undefined ) { throw new Error(`unknown browser: ${key}`); }
