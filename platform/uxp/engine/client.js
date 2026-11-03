@@ -21,8 +21,8 @@
 /* global Worker, setTimeout, clearTimeout */
 
 // uBO's background page asks js/uxp-engine-worker.js (worker.js) to build
-// the network filtering engine (tools/uxp-patches.mjs, storage.js). Shipped
-// as js/uxp-engine.js.
+// the network filtering engine (storage.js, loadFilterLists()). Shipped as
+// js/uxp-engine.js.
 
 const WORKER_URL = 'js/uxp-engine-worker.js';
 

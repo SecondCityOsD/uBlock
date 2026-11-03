@@ -19,37 +19,38 @@
 */
 
 // Assembles dist/uBlock0_<version>.uxp.xpi from:
-//   upstream/      pristine uBlock Origin release tree (copied, never edited)
-//   platform/uxp/  the WebExtension runtime for UXP
+//   upstream/      uBlock Origin's release tree, with our changes to its code
+//                  marked [uBlock-UXP] (PLAN.md, "Changes to uBO's code")
+//   platform/uxp/  the WebExtension runtime for UXP, and the worker that
+//                  builds uBO's network filtering engine (engine/)
 //
 // The upstream steps mirror upstream's own Firefox build, so the package
-// holds exactly what uBO's Firefox XPI holds, plus the UXP overlay:
+// holds what uBO's Firefox XPI holds, plus the UXP overlay:
 //   tools/copy-common-files.sh, tools/make-firefox.sh,
 //   tools/make-firefox-meta.py, tools/make-assets.sh
-// One exception: constructs UXP's JavaScript engine runs far slower than
-// Firefox's are rewritten in the package's copy, behavior unchanged
-// (tools/uxp-compat.mjs). And where uBO's behavior has to differ on UXP,
-// its code is patched (tools/uxp-patches.mjs): its network filtering
-// engine is built in a worker (platform/uxp/engine/), bundled with that copy
-// of uBO's modules into js/uxp-engine-worker.js.
+// Constructs UXP's JavaScript engine runs far slower than Firefox's are
+// rewritten in the package's copy, behavior unchanged (tools/uxp-compat.mjs),
+// and the engine's worker is bundled with that copy of uBO's modules into
+// js/uxp-engine-worker.js.
 //
 // A release build also writes dist/update.rdf, the update manifest that
 // offers it (PLAN.md, "Releasing").
 //
 // Usage: node tools/make-uxp.mjs [--debug] [--no-assets] [--refresh-assets]
-//            [--no-patches]
+//            [--pristine]
 //   --debug           include the test harness (platform/uxp/debug/)
 //   --no-assets       don't bundle filter lists (uBO fetches them at runtime)
 //   --refresh-assets  re-download the bundled filter lists
-//   --no-patches      leave uBO's code unpatched, to compare (not for release)
+//   --pristine        build uBO's code as released, without our changes, to
+//                     compare (debug builds only)
 
-import { applyPatches } from './uxp-patches.mjs';
 import { buildSync } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import { rewriteSuperCalls } from './uxp-compat.mjs';
+import { spawnSync } from 'node:child_process';
 import zlib from 'node:zlib';
 
 /******************************************************************************/
@@ -112,6 +113,12 @@ const DIST = path.join(ROOT, 'dist');
 const BUILD = path.join(DIST, 'build', 'uBlock0.uxp');
 const ASSETS_CACHE = path.join(DIST, 'uAssets-cache');
 
+// The commit that imported upstream/ as uBO released it. Our changes to its
+// code came after, each marked [uBlock-UXP]; a new release of uBO is
+// imported over this commit and merged (PLAN.md, "Changes to uBO's code").
+const PRISTINE_COMMIT = 'b9cd483d45bae69176f1477b1ce5ff67a3bdefbc';
+const CHANGE_MARK = '[uBlock-UXP]';
+
 /******************************************************************************/
 
 const copyDir = (from, to) => {
@@ -141,9 +148,34 @@ const escapeXML = s => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 
 /******************************************************************************/
 
+// upstream/ as of PRISTINE_COMMIT, extracted once into dist/.
+const pristineUpstream = ( ) => {
+    const des = path.join(DIST, `pristine-${PRISTINE_COMMIT.slice(0, 12)}`);
+    if ( fs.existsSync(des) ) { return path.join(des, 'upstream'); }
+    const tmp = `${des}.tmp`;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    // Relative paths: the GNU tar of Git for Windows takes "D:" for a host.
+    const run = (cwd, command, args) => {
+        const result = spawnSync(command, args, {
+            cwd,
+            encoding: 'utf8',
+            stdio: [ 'ignore', 'ignore', 'pipe' ],
+        });
+        if ( result.status !== 0 ) {
+            throw new Error(`${command} ${args.join(' ')}: ${result.error || result.stderr.trim()}`);
+        }
+    };
+    run(ROOT, 'git', [ 'archive', '--format=tar', `--output=${path.relative(ROOT, tmp)}/upstream.tar`, PRISTINE_COMMIT, 'upstream' ]);
+    run(tmp, 'tar', [ '-xf', 'upstream.tar' ]);
+    fs.rmSync(path.join(tmp, 'upstream.tar'));
+    fs.renameSync(tmp, des);
+    return path.join(des, 'upstream');
+};
+
 // tools/copy-common-files.sh + tools/make-firefox.sh
-const assembleUpstream = des => {
-    const src = path.join(UPSTREAM, 'src');
+const assembleUpstream = (des, upstream) => {
+    const src = path.join(upstream, 'src');
     copyDir(path.join(src, 'css'), path.join(des, 'css'));
     copyDir(path.join(src, 'img'), path.join(des, 'img'));
     copyMatching(path.join(src, 'js'), /\.js$/, path.join(des, 'js'));
@@ -154,15 +186,27 @@ const assembleUpstream = des => {
     copyDir(path.join(src, 'web_accessible_resources'), path.join(des, 'web_accessible_resources'));
     copyDir(path.join(src, '_locales'), path.join(des, '_locales'));
     copyMatching(src, /\.html$/, des);
-    copyMatching(path.join(UPSTREAM, 'platform', 'common'), /\.js$/, path.join(des, 'js'));
-    copyMatching(path.join(UPSTREAM, 'platform', 'common'), /\.json$/, des);
-    fs.copyFileSync(path.join(UPSTREAM, 'LICENSE.txt'), path.join(des, 'LICENSE.txt'));
+    copyMatching(path.join(upstream, 'platform', 'common'), /\.js$/, path.join(des, 'js'));
+    copyMatching(path.join(upstream, 'platform', 'common'), /\.json$/, des);
+    fs.copyFileSync(path.join(upstream, 'LICENSE.txt'), path.join(des, 'LICENSE.txt'));
 
     // Firefox-specific
-    copyMatching(path.join(UPSTREAM, 'platform', 'firefox'), /\.json$/, des);
-    copyMatching(path.join(UPSTREAM, 'platform', 'firefox'), /\.js$/, path.join(des, 'js'));
+    copyMatching(path.join(upstream, 'platform', 'firefox'), /\.json$/, des);
+    copyMatching(path.join(upstream, 'platform', 'firefox'), /\.js$/, path.join(des, 'js'));
     copyDir(path.join(des, '_locales', 'nb'), path.join(des, '_locales', 'no'));
     fs.rmSync(path.join(des, 'img', 'icon_128.png'));
+};
+
+// The package's files that hold changes to uBO's code, and how many marked
+// spots each: what the build log shows of them.
+const changedFiles = des => {
+    const out = [];
+    for ( const rel of listFiles(des) ) {
+        if ( rel.endsWith('.js') === false ) { continue; }
+        const count = fs.readFileSync(path.join(des, rel), 'utf8').split(CHANGE_MARK).length - 1;
+        if ( count !== 0 ) { out.push(`${rel} (${count})`); }
+    }
+    return out;
 };
 
 // tools/uxp-compat.mjs over upstream's scripts, before the UXP overlay. A
@@ -194,8 +238,7 @@ const rewriteForUXP = des => {
 // the modules it imports from the package's copy of uBO, rewrites included,
 // bundled into one plain worker script (UXP has no module workers); its
 // imports are relative to the package's root, where its entry is placed for
-// the time of the bundling. And its page side, which the patched storage.js
-// imports.
+// the time of the bundling. And its page side, which storage.js imports.
 const ENGINE_WORKER = 'js/uxp-engine-worker.js';
 const ENGINE_CLIENT = 'js/uxp-engine.js';
 
@@ -237,9 +280,9 @@ const writeFirefoxMeta = (des, version) => {
 };
 
 // tools/make-assets.sh
-const bundleAssets = async (des, version, options) => {
+const bundleAssets = async (des, upstream, version, options) => {
     const assetsDir = path.join(des, 'assets');
-    copyDir(path.join(UPSTREAM, 'assets'), assetsDir);
+    copyDir(path.join(upstream, 'assets'), assetsDir);
     const isRelease = /^\d+\.\d+\.\d+$/.test(version);
     fs.rmSync(path.join(assetsDir, isRelease ? 'assets.dev.json' : 'assets.json'));
     if ( options.noAssets ) { return { bundled: 0, missing: [] }; }
@@ -452,20 +495,25 @@ const main = async ( ) => {
         debug: args.has('--debug'),
         noAssets: args.has('--no-assets'),
         refreshAssets: args.has('--refresh-assets'),
-        patches: args.has('--no-patches') === false,
+        pristine: args.has('--pristine'),
     };
+    if ( options.pristine && options.debug === false ) {
+        throw new Error('--pristine builds are for comparing, not for release: add --debug');
+    }
 
-    const version = fs.readFileSync(path.join(UPSTREAM, 'dist', 'version'), 'utf8').trim();
+    const upstream = options.pristine ? pristineUpstream() : UPSTREAM;
+    const version = fs.readFileSync(path.join(upstream, 'dist', 'version'), 'utf8').trim();
     const emVersion = `${version}.${UXP_REVISION}`;
 
     fs.rmSync(BUILD, { recursive: true, force: true });
     fs.mkdirSync(BUILD, { recursive: true });
 
-    const assets = await bundleAssets(BUILD, version, options);
-    assembleUpstream(BUILD);
+    const assets = await bundleAssets(BUILD, upstream, version, options);
+    assembleUpstream(BUILD, upstream);
+    const changed = changedFiles(BUILD);
     const compat = rewriteForUXP(BUILD);
-    const patched = options.patches ? applyPatches(BUILD) : [];
-    const workerSize = addEngine(BUILD);
+    // uBO's code as released doesn't use the engine's worker.
+    const workerSize = options.pristine ? 0 : addEngine(BUILD);
     const manifest = writeFirefoxMeta(BUILD, version);
     overlayPlatform(BUILD, options);
     writeInstallRdf(BUILD, manifest, emVersion, options);
@@ -479,12 +527,19 @@ const main = async ( ) => {
     const size = (fs.statSync(xpiPath).size / 1048576).toFixed(2);
     console.log(`Built ${path.relative(ROOT, xpiPath)} (${names.length} files, ${size} MB)`);
     console.log(`  upstream ${version}, em:version ${emVersion}, ${options.debug ? 'debug' : 'release'}`);
+    if ( options.pristine ) {
+        console.log(`  uBO's code as released (${PRISTINE_COMMIT.slice(0, 7)}, --pristine): ${changed.length === 0 ? 'no changes' : `WARNING: changes in ${changed.join(', ')}`}`);
+    } else {
+        console.log(`  changes to uBO's code (${CHANGE_MARK}): ${changed.join(', ')}`);
+    }
     console.log(`  UXP rewrites: ${compat.rewritten} super calls in ${compat.files} files (${compat.kept} other uses of super left as they are)`);
     for ( const entry of compat.failed ) {
         console.warn(`  WARNING: not rewritten: ${entry}`);
     }
-    console.log(`  UXP patches: ${options.patches ? patched.join(', ') : 'not applied (--no-patches)'}`);
-    console.log(`  engine worker: ${ENGINE_WORKER} (${(workerSize / 1024).toFixed(0)} KB)`);
+    console.log(options.pristine
+        ? '  engine worker: not added (--pristine)'
+        : `  engine worker: ${ENGINE_WORKER} (${(workerSize / 1024).toFixed(0)} KB)`
+    );
     if ( options.noAssets ) {
         console.log('  filter lists: not bundled (--no-assets)');
     } else {

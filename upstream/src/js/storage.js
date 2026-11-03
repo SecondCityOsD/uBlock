@@ -45,6 +45,9 @@ import { redirectEngine } from './redirect-engine.js';
 import staticExtFilteringEngine from './static-ext-filtering.js';
 import { staticFilteringReverseLookup } from './reverselookup.js';
 import staticNetFilteringEngine from './static-net-filtering.js';
+// [uBlock-UXP] platform/uxp/engine/client.js: builds the network filtering
+// engine in a worker.
+import { buildNetworkEngine as uxpBuildNetworkEngine } from './uxp-engine.js';
 import µb from './background.js';
 
 /******************************************************************************/
@@ -900,8 +903,11 @@ onBroadcast(msg => {
 
     const elapsed = ( ) => `${Date.now() - t0} ms`;
 
-    const onDone = ( ) => {
+    const onDone = async ( ) => {
         ubolog(`loadFilterLists() All filters in memory at ${elapsed()}`);
+
+        // [uBlock-UXP] See buildNetworkEngine().
+        await buildNetworkEngine();
 
         staticNetFilteringEngine.freeze();
         staticExtFilteringEngine.freeze();
@@ -932,21 +938,62 @@ onBroadcast(msg => {
         loadingPromise = undefined;
     };
 
+    // [uBlock-UXP] UXP has no extension process: building the network
+    // filtering engine here would block the browser for seconds. Each
+    // list's cosmetic part is loaded as it comes, its network part kept,
+    // with what the cosmetic part counted, for onDone().
+    const networkLists = [];
+
     const applyCompiledFilters = (assetKey, compiled) => {
         ubolog(`loadFilterLists() Loading filters from ${assetKey} at ${elapsed()}`);
-        const snfe = staticNetFilteringEngine;
         const sxfe = staticExtFilteringEngine;
-        let acceptedCount = snfe.acceptedCount + sxfe.acceptedCount;
-        let discardedCount = snfe.discardedCount + sxfe.discardedCount;
-        µb.applyCompiledFilters(compiled, assetKey === µb.userFiltersPath);
-        if ( Object.hasOwn(µb.availableFilterLists, assetKey) ) {
-            const entry = µb.availableFilterLists[assetKey];
-            entry.entryCount = snfe.acceptedCount + sxfe.acceptedCount -
-                acceptedCount;
-            entry.entryUsedCount = entry.entryCount -
-                (snfe.discardedCount + sxfe.discardedCount - discardedCount);
-        }
+        const acceptedCount = sxfe.acceptedCount;
+        const discardedCount = sxfe.discardedCount;
+        µb.applyCompiledFilters(compiled, assetKey === µb.userFiltersPath, false);
+        networkLists.push({
+            key: assetKey,
+            compiled,
+            accepted: sxfe.acceptedCount - acceptedCount,
+            discarded: sxfe.discardedCount - discardedCount,
+        });
         loadedListKeys.push(assetKey);
+    };
+
+    // [uBlock-UXP] The network engine, from the lists' network parts:
+    // built in a worker and loaded from its selfie, or, if that fails,
+    // built here as upstream does. A list's counts are what its
+    // cosmetic and its network filters counted.
+    const buildNetworkEngine = async ( ) => {
+        const lists = networkLists.splice(0);
+        const snfe = staticNetFilteringEngine;
+        let counts;
+        try {
+            const built = await uxpBuildNetworkEngine(lists);
+            if ( snfe.fromSelfie(built.selfie) !== true ) {
+                throw new Error('fromSelfie() failed');
+            }
+            counts = built.counts;
+            ubolog(`loadFilterLists() Network filters built in a worker at ${elapsed()}`);
+        } catch (reason) {
+            ubolog(`loadFilterLists() Network filters built on the page: ${reason}`);
+            snfe.reset();
+            counts = {};
+            for ( const { key, compiled } of lists ) {
+                const accepted = snfe.acceptedCount;
+                const discarded = snfe.discardedCount;
+                if ( compiled !== '' ) {
+                    snfe.fromCompiled(new CompiledListReader(compiled));
+                }
+                counts[key] = [ snfe.acceptedCount - accepted, snfe.discardedCount - discarded ];
+            }
+        }
+        for ( const { key, accepted, discarded } of lists ) {
+            if ( Object.hasOwn(µb.availableFilterLists, key) === false ) { continue; }
+            const [ netAccepted, netDiscarded ] = counts[key] || [ 0, 0 ];
+            const entry = µb.availableFilterLists[key];
+            entry.entryCount = accepted + netAccepted;
+            entry.entryUsedCount = entry.entryCount - (discarded + netDiscarded);
+        }
     };
 
     const onFilterListsReady = lists => {
@@ -963,6 +1010,8 @@ onBroadcast(msg => {
         }
         staticExtFilteringEngine.reset();
         staticNetFilteringEngine.reset();
+        // [uBlock-UXP]
+        networkLists.length = 0;
         µb.selfieManager.destroy();
         staticFilteringReverseLookup.resetLists();
 
@@ -992,9 +1041,14 @@ onBroadcast(msg => {
                     });
             }
             if ( µb.inMemoryFiltersCompiled !== '' ) {
-                toLoad.push(
-                    µb.applyCompiledFilters(µb.inMemoryFiltersCompiled, true)
-                );
+                // [uBlock-UXP] Its network part goes with the lists'.
+                µb.applyCompiledFilters(µb.inMemoryFiltersCompiled, true, false);
+                networkLists.push({
+                    key: 'in-memory',
+                    compiled: µb.inMemoryFiltersCompiled,
+                    accepted: 0,
+                    discarded: 0,
+                });
             }
         }
 
@@ -1012,7 +1066,10 @@ onBroadcast(msg => {
         }).then(lists => {
             return onFilterListsReady(lists)
         }).then(( ) => {
-            onDone();
+            // [uBlock-UXP] onDone() waits for the network engine's worker,
+            // and so does whoever awaits loadFilterLists() (start.js before
+            // readyToFilter).
+            return onDone();
         });
         return loadingPromise;
     };
@@ -1180,10 +1237,14 @@ onBroadcast(msg => {
 //   Added `firstparty` argument: to avoid discarding cosmetic filters when
 //   applying 1st-party filters.
 
-µb.applyCompiledFilters = function(rawText, firstparty) {
+// [uBlock-UXP] withNetwork false leaves the network filters to
+// loadFilterLists(), which builds that engine in a worker.
+µb.applyCompiledFilters = function(rawText, firstparty, withNetwork = true) {
     if ( rawText === '' ) { return; }
     const reader = new CompiledListReader(rawText);
-    staticNetFilteringEngine.fromCompiled(reader);
+    if ( withNetwork ) {
+        staticNetFilteringEngine.fromCompiled(reader);
+    }
     staticExtFilteringEngine.fromCompiledContent(reader, {
         skipGenericCosmetic: this.userSettings.ignoreGenericCosmeticFilters,
         skipCosmetic: !firstparty && !this.userSettings.parseAllABPHideFilters
