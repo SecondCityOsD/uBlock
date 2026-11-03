@@ -28,7 +28,10 @@
 // settles. The request ID lives in the channel's property bag, which Gecko
 // copies to the new channel on redirect, so it survives redirects as in
 // Firefox. Requests made by the browser itself are not exposed (as in
-// Firefox).
+// Firefox). filterResponseData() gives the response body to the extension
+// (see StreamFilter). Loads of the extension's own web-accessible resources
+// by web pages get onBeforeRequest from Extension.jsm's content policy (see
+// onResourceLoad()).
 //
 // Priming: from every (re)start of the background page until uBO adds its
 // first onBeforeRequest listener, requests are suspended, then run through
@@ -37,9 +40,9 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Ci, Cr, Cu, Services, XPCOMUtils, setTimeout, clearTimeout,
+/* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, setTimeout, clearTimeout,
           dispatch, MatchPattern, outerWindowIdOf, errorNameOf, EventManager,
-          apiAsync */
+          ExtensionError, PageValue, apiSync, apiAsync */
 /* exported createWebRequestAPIs */
 
 'use strict';
@@ -60,7 +63,6 @@ const EVENT_NAMES = [
     'onHeadersReceived', 'onAuthRequired', 'onResponseStarted',
     'onBeforeRedirect', 'onCompleted', 'onErrorOccurred',
 ];
-const TRACING_EVENTS = [ 'onResponseStarted', 'onCompleted', 'onErrorOccurred' ];
 
 const RESOURCE_TYPES = {
     BEACON: 'beacon', CSP_REPORT: 'csp_report', FONT: 'font', IMAGE: 'image',
@@ -231,9 +233,10 @@ const compileSpec = function(args) {
 
 // Wraps a channel's stream listener to see the response start and the end
 // of the request, whatever the outcome. Installed at request time, so it
-// also sees failures and requests the extension cancelled. After a redirect
-// the wrapper moves to the new channel with the rest of the listener chain:
-// it only reports for its own channel.
+// also sees failures and requests the extension cancelled; once the response
+// starts, a stream filter can no longer be attached. After a redirect the
+// wrapper moves to the new channel with the rest of the listener chain: it
+// only reports for its own channel.
 
 const TracingListener = class {
     constructor(service, request) {
@@ -270,6 +273,256 @@ TracingListener.prototype.QueryInterface = XPCOMUtils.generateQI([
 
 /******************************************************************************/
 
+// webRequest.filterResponseData(): Firefox's StreamFilter, attached the way
+// Firefox attaches it (StreamFilterParent): through nsITraceableChannel, as
+// the channel's first stream listener, any time before the response starts.
+// It gets the body after content decoding; the rest of the listener chain
+// gets what the extension writes, and the end of the response once the
+// extension closes or disconnects the filter. As in Firefox, a redirected
+// channel's filter fails and its response passes through unfiltered, and
+// the response goes on unfiltered when the extension page goes away.
+//
+// Events fire from the channel's own callbacks rather than from a later
+// task: uBO writes and closes from its onstop handler, so a document gets
+// the end of its data in the same callback in which the channel ends.
+
+const FILTER_OPEN = new Set([
+    'uninitialized', 'transferringdata', 'finishedtransferringdata', 'suspended',
+]);
+const FILTER_WRITABLE = new Set([
+    'transferringdata', 'finishedtransferringdata', 'suspended',
+]);
+
+const bytesOfStream = function(stream, count) {
+    const binary = Cc['@mozilla.org/binaryinputstream;1']
+        .createInstance(Ci.nsIBinaryInputStream);
+    binary.setInputStream(stream);
+    const buffer = new ArrayBuffer(count);
+    binary.readArrayBuffer(count, buffer);
+    return buffer;
+};
+
+const StreamFilter = class {
+    constructor(context, request) {
+        this.context = context;
+        this.channel = request !== null ? request.channel : null;
+        this.status = 'uninitialized';
+        this.error = '';
+        this.next = null;           // the rest of the channel's listener chain
+        this.request = null;        // as the channel's callbacks pass it
+        this.callbackArgs = [];     // and their context argument (Gecko 52)
+        this.offset = 0;            // bytes given to the chain so far
+        this.started = false;
+        this.stopped = false;
+        this.passThrough = false;   // data goes on as it comes
+        this.heldStop = null;       // the channel's end, until the extension is done
+        this.suspended = false;
+        this.onUnload = ( ) => {
+            if ( FILTER_OPEN.has(this.status) ) { this.letThrough('disconnected', ''); }
+        };
+        context.callOnUnload(this.onUnload);
+        this.page = this.makePageObject();
+    }
+
+    makePageObject() {
+        const { context } = this;
+        const filter = context.createObject();
+        const method = (name, fn) => {
+            filter[name] = context.exportFunction((...args) => {
+                try {
+                    return fn(...args);
+                } catch (ex) {
+                    throw context.pageError(ex);
+                }
+            }, filter);
+        };
+        method('write', data => { this.write(data); });
+        method('close', ( ) => { this.close(); });
+        method('disconnect', ( ) => { this.disconnect(); });
+        method('suspend', ( ) => { this.suspend(); });
+        method('resume', ( ) => { this.resume(); });
+        for ( const name of [ 'status', 'error' ] ) {
+            Object.defineProperty(filter, name, {
+                get: context.exportFunction(( ) => this[name], filter),
+                enumerable: true,
+                configurable: true,
+            });
+        }
+        for ( const name of [ 'onstart', 'ondata', 'onstop', 'onerror' ] ) {
+            filter[name] = null;
+        }
+        return filter;
+    }
+
+    attach() {
+        if ( this.channel === null ) { return false; }
+        try {
+            this.next = this.channel
+                .QueryInterface(Ci.nsITraceableChannel)
+                .setNewListener(this);
+            return true;
+        } catch (ex) {
+        }
+        return false;
+    }
+
+    fire(type, fields = {}) {
+        if ( this.context.unloaded ) { return; }
+        const handler = this.page[`on${type}`];
+        if ( typeof handler !== 'function' ) { return; }
+        try {
+            handler.call(this.page, this.context.cloneOut(Object.assign({ type }, fields)));
+        } catch (ex) {
+            Cu.reportError(ex);
+        }
+    }
+
+    forward(stream, count) {
+        const offset = this.offset;
+        this.offset += count;
+        this.next.onDataAvailable(this.request, ...this.callbackArgs, stream, offset, count);
+    }
+
+    stopChain(status) {
+        if ( this.started === false || this.stopped ) { return; }
+        this.stopped = true;
+        this.heldStop = null;
+        this.next.onStopRequest(this.request, ...this.callbackArgs, status);
+    }
+
+    resumeChannel() {
+        if ( this.suspended === false ) { return; }
+        this.suspended = false;
+        try {
+            this.channel.resume();
+        } catch (ex) {
+        }
+    }
+
+    // No more filtering: the rest of the response goes on as it comes.
+    letThrough(status, error) {
+        this.status = status;
+        this.error = error;
+        this.passThrough = true;
+        this.resumeChannel();
+        if ( this.heldStop !== null ) { this.stopChain(this.heldStop); }
+        this.context.forgetOnUnload(this.onUnload);
+    }
+
+    fail(error) {
+        this.letThrough('failed', error);
+        this.fire('error');
+    }
+
+    // The extension's side
+
+    write(data) {
+        if ( FILTER_WRITABLE.has(this.status) === false ) {
+            throw new ExtensionError(`StreamFilter.write: invalid state (${this.status})`);
+        }
+        let bytes = this.context.cloneIn(data);
+        if ( bytes instanceof ArrayBuffer ) { bytes = new Uint8Array(bytes); }
+        if ( bytes instanceof Uint8Array === false ) {
+            throw new ExtensionError('StreamFilter.write: data must be an ArrayBuffer or a Uint8Array');
+        }
+        if ( bytes.byteLength === 0 ) { return; }
+        const stream = Cc['@mozilla.org/io/arraybuffer-input-stream;1']
+            .createInstance(Ci.nsIArrayBufferInputStream);
+        stream.setData(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        this.forward(stream, bytes.byteLength);
+    }
+
+    // The rest of the response is dropped; the chain ends with what was
+    // written (once the response starts, if it has not yet).
+    close() {
+        if ( FILTER_OPEN.has(this.status) === false ) {
+            throw new ExtensionError(`StreamFilter.close: invalid state (${this.status})`);
+        }
+        this.status = 'closed';
+        this.resumeChannel();
+        this.stopChain(Cr.NS_OK);
+        this.context.forgetOnUnload(this.onUnload);
+    }
+
+    disconnect() {
+        if ( FILTER_OPEN.has(this.status) === false ) {
+            throw new ExtensionError(`StreamFilter.disconnect: invalid state (${this.status})`);
+        }
+        this.letThrough('disconnected', '');
+    }
+
+    suspend() {
+        if ( this.status !== 'transferringdata' ) {
+            throw new ExtensionError(`StreamFilter.suspend: invalid state (${this.status})`);
+        }
+        this.channel.suspend();
+        this.suspended = true;
+        this.status = 'suspended';
+    }
+
+    resume() {
+        if ( this.status !== 'suspended' ) {
+            throw new ExtensionError(`StreamFilter.resume: invalid state (${this.status})`);
+        }
+        this.resumeChannel();
+        this.status = 'transferringdata';
+    }
+
+    // The channel's side (nsIStreamListener)
+
+    onStartRequest(request, ...args) {
+        this.request = request;
+        this.callbackArgs = args;
+        this.started = true;
+        this.next.onStartRequest(request, ...args);
+        if ( this.status === 'closed' ) {
+            this.stopChain(Cr.NS_OK);
+            return;
+        }
+        if ( this.passThrough ) { return; }
+        if ( request !== this.channel ) {
+            this.fail('Channel redirected');
+            return;
+        }
+        this.status = 'transferringdata';
+        this.fire('start');
+    }
+
+    onDataAvailable(request, ...args) {
+        const [ stream, , count ] = args.slice(-3);
+        if ( this.passThrough ) {
+            this.forward(stream, count);
+            return;
+        }
+        // Read even when dropped: a listener consumes what it is given.
+        const data = bytesOfStream(stream, count);
+        if ( this.status === 'closed' ) { return; }
+        this.fire('data', { data });
+    }
+
+    onStopRequest(request, ...args) {
+        if ( this.stopped ) { return; }
+        const status = args[args.length - 1];
+        if ( this.passThrough || this.status === 'closed' ) {
+            this.stopChain(status);
+            return;
+        }
+        this.heldStop = status;
+        if ( Components.isSuccessCode(status) === false ) {
+            this.fail(errorNameOf(status));
+            return;
+        }
+        this.status = 'finishedtransferringdata';
+        this.fire('stop');
+    }
+};
+StreamFilter.prototype.QueryInterface = XPCOMUtils.generateQI([
+    Ci.nsIStreamListener,
+    Ci.nsIRequestObserver,
+]);
+
+/******************************************************************************/
+
 const WebRequestService = class {
     constructor(extension) {
         this.extension = extension;
@@ -278,6 +531,9 @@ const WebRequestService = class {
         this.priming = false;
         this.primed = [];
         this.primingTimer = null;
+        // Requests a stream filter can still be attached to, by request ID:
+        // until their response starts.
+        this.live = new Map();
         this.events = {};
         for ( const name of EVENT_NAMES ) {
             this.events[name] = new EventManager(`webRequest.${name}`, name === 'onBeforeRequest'
@@ -385,26 +641,11 @@ const WebRequestService = class {
         if ( type === 'websocket' ) {
             url = url.replace(/^http(s?):/, 'ws$1:');
         }
-        const tab = browser !== null ? this.tracker.tabForBrowser(browser) : null;
-        // Frame IDs as in Firefox: 0 for the tab's top-level window.
-        let frameId = 0;
-        let parentFrameId = -1;
-        if ( tab !== null && type !== 'main_frame' ) {
-            let windowId = loadInfo.outerWindowID;
-            let parentWindowId = loadInfo.parentOuterWindowID;
-            if ( loadInfo.frameOuterWindowID ) {
-                windowId = loadInfo.frameOuterWindowID;
-                parentWindowId = loadInfo.outerWindowID;
-            }
-            let topWindowId = 0;
-            try {
-                topWindowId = outerWindowIdOf(browser.contentWindow);
-            } catch (ex) {
-            }
-            if ( windowId !== 0 && windowId !== topWindowId ) {
-                frameId = windowId;
-                parentFrameId = parentWindowId === topWindowId ? 0 : parentWindowId;
-            }
+        let windowId = loadInfo.outerWindowID;
+        let parentWindowId = loadInfo.parentOuterWindowID;
+        if ( loadInfo.frameOuterWindowID ) {
+            windowId = loadInfo.frameOuterWindowID;
+            parentWindowId = loadInfo.outerWindowID;
         }
         let documentUrl;
         if ( type !== 'main_frame' ) {
@@ -423,22 +664,47 @@ const WebRequestService = class {
             incognito = loadInfo.originAttributes.privateBrowsingId > 0;
         } catch (ex) {
         }
-        request.details = {
+        request.details = Object.assign({
             requestId: requestIdOf(channel),
             url,
             method: channel.requestMethod,
             type,
-            tabId: tab !== null ? this.tracker.getId(browser) : -1,
-            windowId: tab !== null ? this.tracker.windowIdOf(tab.ownerGlobal) : -1,
-            frameId,
-            parentFrameId,
+        }, this.tabDetails(browser, type, windowId, parentWindowId), {
             originUrl: triggering && triggering.URI ? triggering.URI.spec : undefined,
             documentUrl,
             incognito,
             cookieStoreId: 'firefox-default',
             proxyInfo: proxyInfoOf(channel),
-        };
+        });
         return request.details;
+    }
+
+    // Firefox's tab, window and frame IDs: frame 0 is the tab's top-level
+    // window, other frames go by their outer window ID.
+    tabDetails(browser, type, windowId, parentWindowId) {
+        const tab = browser !== null ? this.tracker.tabForBrowser(browser) : null;
+        if ( tab === null ) {
+            return { tabId: -1, windowId: -1, frameId: 0, parentFrameId: -1 };
+        }
+        let frameId = 0;
+        let parentFrameId = -1;
+        if ( type !== 'main_frame' ) {
+            let topWindowId = 0;
+            try {
+                topWindowId = outerWindowIdOf(browser.contentWindow);
+            } catch (ex) {
+            }
+            if ( windowId !== 0 && windowId !== topWindowId ) {
+                frameId = windowId;
+                parentFrameId = parentWindowId === topWindowId ? 0 : parentWindowId;
+            }
+        }
+        return {
+            tabId: this.tracker.getId(browser),
+            windowId: this.tracker.windowIdOf(tab.ownerGlobal),
+            frameId,
+            parentFrameId,
+        };
     }
 
     specOf(args) {
@@ -624,20 +890,33 @@ const WebRequestService = class {
         this.dispatch('onBeforeRedirect', request, Object.assign({ redirectUrl }, response));
     }
 
+    // Every request is traced: the tracing listener also tells until when a
+    // stream filter can be attached.
     traceRequest(request) {
-        if ( TRACING_EVENTS.every(name => this.events[name].hasListeners === false) ) { return; }
         // The upgrade machinery of WebSocket channels is left alone.
-        if ( this.baseDetails(request).type === 'websocket' ) { return; }
+        const { type, requestId } = this.baseDetails(request);
+        if ( type === 'websocket' ) { return; }
         const listener = new TracingListener(this, request);
         try {
             listener.original = request.channel
                 .QueryInterface(Ci.nsITraceableChannel)
                 .setNewListener(listener);
         } catch (ex) {
+            return;
+        }
+        // After a redirect, the new channel's request takes the same ID.
+        this.live.set(requestId, request);
+    }
+
+    forget(request) {
+        const { requestId } = request.details;
+        if ( this.live.get(requestId) === request ) {
+            this.live.delete(requestId);
         }
     }
 
     onResponseStarted(request) {
+        this.forget(request);
         try {
             if ( Components.isSuccessCode(request.channel.status) === false ) { return; }
             this.dispatch('onResponseStarted', request, responseDetailsOf(request.channel));
@@ -647,6 +926,7 @@ const WebRequestService = class {
     }
 
     onRequestStopped(request, status) {
+        this.forget(request);
         try {
             if ( status === Cr.NS_BINDING_REDIRECTED ) { return; }
             if ( Components.isSuccessCode(status) ) {
@@ -660,6 +940,67 @@ const WebRequestService = class {
         } catch (ex) {
             Cu.reportError(ex);
         }
+    }
+
+    /**************************************************************************/
+
+    filterResponseData(context, requestId) {
+        const request = this.live.get(String(requestId)) || null;
+        const filter = new StreamFilter(context, request);
+        if ( filter.attach() === false ) {
+            // As in Firefox, an event: the caller has set its handlers by then.
+            dispatch(( ) => { filter.fail('Invalid request ID'); });
+        }
+        return filter;
+    }
+
+    // A web page loading one of the extension's web-accessible resources,
+    // seen by Extension.jsm's content policy: onBeforeRequest only, its
+    // blocking listeners answered on the spot -- as Firefox 52 did for any
+    // load that was not HTTP. uBO checks there the secret its resources'
+    // URLs carry. A listener's Promise cannot be waited for in a content
+    // policy. Returns true when a listener cancelled the load.
+    onResourceLoad(policyType, location, requestOrigin, node, requestPrincipal) {
+        if ( this.events.onBeforeRequest.hasListeners === false ) { return false; }
+        const type = typeOfPolicy(policyType);
+        // The window the resource loads into: a frame's own for a subdocument.
+        let win = null;
+        try {
+            if ( type === 'sub_frame' && node.contentWindow ) {
+                win = node.contentWindow;
+            } else if ( node instanceof Ci.nsIDOMWindow ) {
+                win = node;
+            } else {
+                win = (node.ownerDocument || node).defaultView;
+            }
+        } catch (ex) {
+        }
+        const browser = win ? this.tracker.browserForContentWindow(win) : null;
+        let incognito = false;
+        try {
+            incognito = requestPrincipal.originAttributes.privateBrowsingId > 0;
+        } catch (ex) {
+        }
+        const details = Object.assign({
+            requestId: String(nextRequestId++),
+            url: location.spec,
+            method: 'GET',
+            type,
+        }, this.tabDetails(
+            browser,
+            type,
+            win ? outerWindowIdOf(win) : 0,
+            win && win.parent !== win ? outerWindowIdOf(win.parent) : 0
+        ), {
+            originUrl: requestPrincipal && requestPrincipal.URI ? requestPrincipal.URI.spec : undefined,
+            documentUrl: requestOrigin ? requestOrigin.spec : undefined,
+            incognito,
+            cookieStoreId: 'firefox-default',
+            proxyInfo: null,
+        });
+        const request = { channel: null, loadInfo: null, browser, details };
+        const { sync } = this.outcomeOf(this.dispatch('onBeforeRequest', request));
+        return sync.some(result => result !== null && typeof result === 'object' && result.cancel === true);
     }
 };
 
@@ -680,6 +1021,9 @@ const createWebRequestAPIs = function(extension) {
                     // once its filtering engines are (re)built: see
                     // Extension.onFiltersReady().
                     handlerBehaviorChanged: apiAsync(( ) => { extension.onFiltersReady(); }),
+                    filterResponseData: apiSync((context, requestId) =>
+                        new PageValue(service.filterResponseData(context, requestId).page)
+                    ),
                     ...service.events,
                 },
             };

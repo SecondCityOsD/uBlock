@@ -29,6 +29,10 @@
 //                        content-script APIs
 //             'ui'       ... check the toolbar button, popup, context menu
 //                        and keyboard shortcuts
+//             'filtering' ... check what only Firefox gives uBO: HTML
+//                        filtering and replace=, CNAME uncloaking, redirect=
+//                        and web-accessible resources, csp=, permissions=,
+//                        header=, strict blocking, privacy settings
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -83,6 +87,20 @@ const readAnyPref = function(name) {
         case Services.prefs.PREF_BOOL: return Services.prefs.getBoolPref(name);
         case Services.prefs.PREF_INT: return Services.prefs.getIntPref(name);
         case Services.prefs.PREF_STRING: return Services.prefs.getCharPref(name);
+        }
+    } catch (ex) {
+    }
+    return null;
+};
+
+// The browser's own value, without the user's; null if it has none.
+const readDefaultPref = function(name) {
+    const branch = Services.prefs.getDefaultBranch('');
+    try {
+        switch ( branch.getPrefType(name) ) {
+        case branch.PREF_BOOL: return branch.getBoolPref(name);
+        case branch.PREF_INT: return branch.getIntPref(name);
+        case branch.PREF_STRING: return branch.getCharPref(name);
         }
     } catch (ex) {
     }
@@ -685,14 +703,36 @@ const openTab = async function(url) {
     return { tab, doc, close: ( ) => { win.gBrowser.removeTab(tab); } };
 };
 
+// Runs each part of a scenario on its own: a failure goes into
+// report.errors and does not hide the next parts.
+const sectionRunner = report => async (name, fn) => {
+    try {
+        await fn();
+    } catch (ex) {
+        report.errors = report.errors || {};
+        report.errors[name] = String(ex);
+    }
+};
+
+// Whether the page's own script can load the image at `url`: 'loaded',
+// 'error' or 'timeout'. A load started from here would be the browser's.
+const pageLoadsImage = function(doc, url) {
+    const key = `load${Math.random().toString(36).slice(2)}`;
+    const script = doc.createElement('script');
+    script.textContent = `{
+        const img = new Image();
+        img.onload = ( ) => { document.documentElement.dataset.${key} = 'loaded'; };
+        img.onerror = ( ) => { document.documentElement.dataset.${key} = 'error'; };
+        img.src = ${JSON.stringify(url)};
+    }`;
+    doc.body.appendChild(script);
+    return waitFor(( ) => doc.documentElement.dataset[key], 5000, url).catch(( ) => 'timeout');
+};
+
 const ownErrors = lines => lines
     .filter(line => line.kind === 'error' || line.kind === 'console.error')
     .filter(line => OWN_SOURCES.test(line.source))
     .map(line => `${line.text} @ ${line.source}`);
-
-const placeholdersHit = lines => Array.from(new Set(
-    lines.filter(l => l.text.includes('is not implemented yet')).map(l => l.text)
-));
 
 // The extension, its background page, and uBO once it reports "all ready"
 // (allReadyAfter starts as '?', see background.js).
@@ -762,7 +802,6 @@ const runBoot = async function() {
             ? `${report.dashboard.listEntries} filter lists rendered, principal ${report.dashboard.principal}`
             : undefined,
         contexts: report.contexts || [],
-        placeholdersHit: placeholdersHit(lines),
         ownErrors: ownErrors(lines),
         ubologTail: lines
             .filter(l => l.kind === 'console.info' && l.text.startsWith('[uBO]'))
@@ -908,6 +947,7 @@ const TestServer = class {
         const host = (/^host:\s*(\S+)/im.exec(request) || [ '', '' ])[1];
         this.requests.push(`${host.replace(/:\d+$/, '')}${path}`);
         const route = this.routes(path.replace(/\?.*$/, ''), this.port);
+        // A body is a binary string: one character per byte.
         const body = route !== null ? route.body : 'not found';
         const response = [
             `HTTP/1.1 ${route !== null ? '200 OK' : '404 Not Found'}`,
@@ -915,6 +955,7 @@ const TestServer = class {
             `Content-Length: ${body.length}`,
             'Cache-Control: no-store',
             'Connection: close',
+            ...(route !== null && route.headers || []),
             '',
             body,
         ].join('\r\n');
@@ -980,7 +1021,6 @@ const runNetwork = async function() {
         tabAttribution: report.tabAttribution,
         pageStoreCounts: report.pageStoreCounts,
         serverRequests: server.requests,
-        placeholdersHit: placeholdersHit(consoleLines),
         ownErrors: ownErrors(consoleLines),
     };
     if ( failure !== null ) {
@@ -1134,16 +1174,23 @@ const verdicts = (actual, expected) => Object.fromEntries(
     })
 );
 
-// Calls the background page's browser.* API as the page itself would;
-// settles with { value } or { error }.
+// Calls the background page's browser.* API as the page itself would, e.g.
+// 'privacy.network.networkPredictionEnabled.get'; settles with { value } or
+// { error }.
 const callBackground = function(bgWindow, path, ...args) {
     const page = Cu.waiveXrays(bgWindow);
-    const [ namespace, name ] = path.split('.');
+    const names = path.split('.');
+    const method = names.pop();
+    const target = names.reduce((object, name) => object[name], page.browser);
     return new Promise(resolve => {
-        page.browser[namespace][name](...args.map(a => Cu.cloneInto(a, page))).then(
-            Cu.exportFunction(value => { resolve({ value: plain(value) }); }, page),
-            Cu.exportFunction(error => { resolve({ error: String(error && error.message) }); }, page)
-        );
+        try {
+            target[method](...args.map(a => Cu.cloneInto(a, page))).then(
+                Cu.exportFunction(value => { resolve({ value: plain(value) }); }, page),
+                Cu.exportFunction(error => { resolve({ error: String(error && error.message) }); }, page)
+            );
+        } catch (ex) {
+            resolve({ error: String(ex && ex.message || ex) });
+        }
     });
 };
 
@@ -1292,7 +1339,6 @@ const runCosmetic = async function() {
         requestIdleCallback: report.requestIdleCallback,
         contentScripts: report.contentScripts,
         uboFrames: report.uboFrames,
-        placeholdersHit: placeholdersHit(consoleLines),
         ownErrors: ownErrors(consoleLines),
     };
     if ( failure !== null ) {
@@ -1405,37 +1451,7 @@ const runUI = async function() {
         const navbar = win.document.getElementById('nav-bar');
         report.toolbarScreenshot = saveScreenshot(win, win, navbar.getBoundingClientRect(), 'toolbar.png');
 
-        // Web pages may load web-accessible resources (the element picker,
-        // redirect= filters), not the rest of the package. The page's own
-        // script loads them: a load started from here would be the
-        // browser's.
-        const pageLoads = async path => {
-            const key = `load${path.replace(/\W/g, '')}`;
-            const script = page.doc.createElement('script');
-            script.textContent = `{
-                const img = new Image();
-                img.onload = ( ) => { document.documentElement.dataset.${key} = 'true'; };
-                img.onerror = ( ) => { document.documentElement.dataset.${key} = 'false'; };
-                img.src = ${JSON.stringify(ext.getURL(path))};
-            }`;
-            page.doc.body.appendChild(script);
-            return waitFor(( ) => page.doc.documentElement.dataset[key], 5000, path)
-                .then(result => result === 'true', ( ) => 'timeout');
-        };
-        report.webAccessible = {
-            'web_accessible_resources/1x1.gif': await pageLoads('web_accessible_resources/1x1.gif'),
-            'img/icon_16.png': await pageLoads('img/icon_16.png'),
-        };
-
-        // Each part on its own: a failure does not hide the next parts.
-        const section = async (name, fn) => {
-            try {
-                await fn();
-            } catch (ex) {
-                report.errors = report.errors || {};
-                report.errors[name] = String(ex);
-            }
-        };
+        const section = sectionRunner(report);
 
         // Basilisk moves the view into a panelmultiview's anonymous content,
         // which document.querySelector() does not search.
@@ -1610,7 +1626,6 @@ const runUI = async function() {
     checks.commands = pass(Array.isArray(report.commands) && report.commands.length === 8, report.commands);
     checks.shortcut = pass(report.shortcutKey === 'alt,shift L' && report.loggerOpened, [ report.shortcutKey, report.loggerOpened ]);
     checks.shortcutReset = pass(report.shortcutAfterReset === 'none', report.shortcutAfterReset);
-    checks.webAccessible = pass(report.webAccessible && report.webAccessible['web_accessible_resources/1x1.gif'] === true && report.webAccessible['img/icon_16.png'] === false, report.webAccessible);
     const { addonOptions, options = {} } = report;
     checks.addonOptions = pass(addonOptions && addonOptions.inTab && addonOptions.isDashboard && options.button === 'shown',
         [ addonOptions, options.button ]);
@@ -1629,7 +1644,405 @@ const runUI = async function() {
         popupDebug: report.popupDebug,
         pageFrames: report.pageFrames,
         screenshots: [ report.toolbarScreenshot, report.popupScreenshot ].filter(Boolean),
-        placeholdersHit: placeholdersHit(consoleLines),
+        ownErrors: ownErrors(consoleLines),
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
+// Filtering: what uBO does only on Firefox, on pages served as
+// uxp-filtering.test (see the cosmetic scenario for why not 127.0.0.1).
+// HTML filtering, also of a gzip-encoded page, and replace=, both through
+// webRequest.filterResponseData(); redirect= to a web-accessible resource,
+// and a page loading those with and without uBO's secret; header=; csp=
+// and permissions=; strict blocking to document-blocked.html; dns.resolve(),
+// and CNAME uncloaking of a real public hostname (skipped when its CNAME
+// cannot be looked up); the privacy settings uBO controls.
+
+const FILTERING_HOST = 'uxp-filtering.test';
+// A public hostname whose CNAME chain ends on Akamai's akamaiedge.net.
+const CNAME_HOST = 'www.microsoft.com';
+const CNAME_DOMAIN = 'akamaiedge.net';
+
+const FILTERING_FILTERS = [
+    `${FILTERING_HOST}##^#uxp-html-removed`,
+    `${FILTERING_HOST}##^script:has-text(uxpInlineAd)`,
+    `||${FILTERING_HOST}^*/replace.js$script,replace=/uxpBefore/uxpAfter/`,
+    `||${FILTERING_HOST}^*/redirect.js$script,redirect=noop.js`,
+    `||${FILTERING_HOST}^*/header.js$script,header=x-uxp-test:blocked`,
+    `||${FILTERING_HOST}^*/csp.html$csp=script-src 'none'`,
+    `||${FILTERING_HOST}^*/permissions.html$permissions=geolocation=()`,
+    `||${FILTERING_HOST}^*/strict.html$document`,
+    `||${CNAME_DOMAIN}^$image`,
+];
+// replace= takes trusted filters only.
+const FILTERING_USER_SETTINGS = [ [ 'userFiltersTrusted', 'true' ] ];
+
+// `text` (ASCII) gzip-compressed, as a binary string, by Gecko's own
+// converter; null where there is none.
+const gzipOf = function(text) {
+    let converter;
+    try {
+        converter = Cc['@mozilla.org/streamconv;1?from=uncompressed&to=gzip']
+            .createInstance(Ci.nsIStreamConverter);
+    } catch (ex) {
+        return null;
+    }
+    const chunks = [];
+    converter.asyncConvertData('uncompressed', 'gzip', {
+        onStartRequest() {},
+        onDataAvailable(...args) {
+            const [ stream, , count ] = args.slice(-3);
+            const binary = Cc['@mozilla.org/binaryinputstream;1']
+                .createInstance(Ci.nsIBinaryInputStream);
+            binary.setInputStream(stream);
+            chunks.push(binary.readBytes(count));
+        },
+        onStopRequest() {},
+        QueryInterface: XPCOMUtils.generateQI([ Ci.nsIStreamListener, Ci.nsIRequestObserver ]),
+    }, null);
+    const input = Cc['@mozilla.org/io/string-input-stream;1']
+        .createInstance(Ci.nsIStringInputStream);
+    input.setData(text, text.length);
+    converter.onStartRequest(null, null);
+    converter.onDataAvailable(null, null, input, 0, text.length);
+    converter.onStopRequest(null, null, Components.results.NS_OK);
+    return chunks.join('');
+};
+
+const GZIP_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>uxp-gzip</title></head>' +
+    '<body><div id="uxp-html-removed">removed</div><div id="uxp-html-kept">kept</div></body></html>';
+
+const filteringRoutes = function(path) {
+    const html = body => ({ type: 'text/html; charset=utf-8', body: `<!doctype html><html><head><meta charset="utf-8">${body}</html>` });
+    const script = (body, headers) => ({ type: 'application/javascript', body, headers });
+    const dataset = 'document.documentElement.dataset';
+    switch ( path ) {
+    case '/filtering.html':
+        return html(`<title>uxp-filtering</title>
+<script>window.uxpInlineAd = true;</script>
+<script src="/replace.js"></script>
+<script src="/redirect.js" onload="${dataset}.redirect = 'loaded'" onerror="${dataset}.redirect = 'error'"></script>
+<script src="/header.js" onload="${dataset}.header = 'loaded'" onerror="${dataset}.header = 'error'"></script>
+</head><body>
+<div id="uxp-html-removed">removed</div><div id="uxp-html-kept">kept</div>
+<script>
+${dataset}.results = JSON.stringify({
+    htmlRemoved: document.getElementById('uxp-html-removed') === null,
+    htmlKept: document.getElementById('uxp-html-kept') !== null,
+    // Not spelled out here: this script would match the has-text() filter.
+    inlineScriptRan: window['uxpInline' + 'Ad'] === true,
+    replaced: window.uxpReplaced,
+    redirectedScriptRan: window.uxpRedirectedScriptRan === true,
+    headerScriptRan: window.uxpHeaderScriptRan === true,
+});
+</script></body>`);
+    case '/gzip.html': {
+        const gzipped = gzipOf(GZIP_PAGE);
+        return gzipped === null
+            ? { type: 'text/html; charset=utf-8', body: GZIP_PAGE }
+            : { type: 'text/html; charset=utf-8', body: gzipped, headers: [ 'Content-Encoding: gzip' ] };
+    }
+    case '/cname.html':
+        return html(`</head><body><img src="https://${CNAME_HOST}/favicon.ico"
+onload="${dataset}.cname = 'loaded'" onerror="${dataset}.cname = 'error'"></body>`);
+    case '/csp.html':
+        return html(`</head><body><script>${dataset}.scriptRan = 'true';</script></body>`);
+    case '/permissions.html':
+    case '/strict.html':
+        return html('</head><body>uxp</body>');
+    case '/replace.js':
+        return script("window.uxpReplaced = 'uxpBefore';");
+    case '/redirect.js':
+        return script('window.uxpRedirectedScriptRan = true;');
+    case '/header.js':
+        return script('window.uxpHeaderScriptRan = true;', [ 'X-Uxp-Test: blocked' ]);
+    default:
+        return null;
+    }
+};
+
+// Response headers as webRequest listeners see them once uBO's
+// onHeadersReceived has changed them: from an onResponseStarted listener in
+// uBO's own page.
+const recordResponseHeaders = function(bgWindow, host) {
+    const page = Cu.waiveXrays(bgWindow);
+    const seen = new Map();
+    const listener = Cu.exportFunction(details => {
+        const { url, responseHeaders } = Cu.waiveXrays(details);
+        const match = /^https?:\/\/([^/:]+)(?::\d+)?(\/[^?#]*)/.exec(url);
+        if ( match === null || match[1] !== host ) { return; }
+        seen.set(match[2], plain(responseHeaders));
+    }, page);
+    page.browser.webRequest.onResponseStarted.addListener(
+        listener,
+        Cu.cloneInto({ urls: [ 'http://*/*' ] }, page),
+        Cu.cloneInto([ 'responseHeaders' ], page)
+    );
+    return {
+        get(path, name) {
+            const found = (seen.get(path) || []).find(h => h.name.toLowerCase() === name);
+            return found ? found.value : null;
+        },
+        stop() {
+            page.browser.webRequest.onResponseStarted.removeListener(listener);
+        },
+    };
+};
+
+const runFiltering = async function() {
+    const report = {};
+    const checks = {};
+    const section = sectionRunner(report);
+    let failure = null;
+    let headers = null;
+    const server = new TestServer(filteringRoutes);
+    server.start();
+    const base = `http://${FILTERING_HOST}:${server.port}`;
+    try {
+        const { ext, bgWindow, µb } = await whenUBOReady();
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        headers = recordResponseHeaders(bgWindow, FILTERING_HOST);
+
+        // HTML filtering, replace=, redirect=, header=; web-accessible
+        // resources loaded by the page itself
+        await section('page', async ( ) => {
+            const page = await openTab(`${base}/filtering.html`);
+            const data = page.doc.documentElement.dataset;
+            report.page = Object.assign(JSON.parse(data.results || '{}'), {
+                redirect: data.redirect,
+                header: data.header,
+            });
+            const secret = Cu.waiveXrays(bgWindow).vAPI.warSecret.short();
+            report.webAccessible = {
+                withSecret: await pageLoadsImage(page.doc, ext.getURL(`web_accessible_resources/1x1.gif?secret=${secret}`)),
+                withoutSecret: await pageLoadsImage(page.doc, ext.getURL('web_accessible_resources/1x1.gif')),
+                notWebAccessible: await pageLoadsImage(page.doc, ext.getURL('img/icon_16.png')),
+            };
+            page.close();
+        });
+
+        await section('gzip', async ( ) => {
+            const page = await openTab(`${base}/gzip.html`);
+            report.gzip = {
+                encoded: gzipOf('uxp') !== null,
+                htmlRemoved: page.doc.getElementById('uxp-html-removed') === null,
+                htmlKept: page.doc.getElementById('uxp-html-kept') !== null,
+            };
+            page.close();
+        });
+
+        await section('headers', async ( ) => {
+            const csp = await openTab(`${base}/csp.html`);
+            report.csp = {
+                scriptRan: csp.doc.documentElement.dataset.scriptRan === 'true',
+                header: headers.get('/csp.html', 'content-security-policy'),
+            };
+            csp.close();
+            const permissions = await openTab(`${base}/permissions.html`);
+            report.permissions = { header: headers.get('/permissions.html', 'permissions-policy') };
+            permissions.close();
+        });
+
+        // Strict blocking: uBO puts its warning page in the tab instead.
+        await section('strict', async ( ) => {
+            const tab = win.gBrowser.addTab(`${base}/strict.html`);
+            win.gBrowser.selectedTab = tab;
+            const doc = await waitFor(( ) => {
+                const d = tab.linkedBrowser.contentDocument;
+                const shown = d && d.readyState === 'complete' && d.getElementById('theURL');
+                return shown && shown.textContent.includes('strict.html') ? d : null;
+            }, 15000, 'document-blocked.html');
+            report.strict = {
+                page: doc.documentURI.replace(/\?.*$/, ''),
+                isDocumentBlocked: doc.documentURI.startsWith(ext.getURL('document-blocked.html?')),
+                extensionPrincipal: doc.nodePrincipal.originNoSuffix === ext.origin,
+            };
+            win.gBrowser.removeTab(tab);
+        });
+
+        await section('dns', async ( ) => {
+            report.dns = {
+                localhost: await callBackground(bgWindow, 'dns.resolve', 'localhost'),
+                unknownHost: await callBackground(bgWindow, 'dns.resolve', 'uxp-no-such-host.invalid'),
+                cname: await callBackground(bgWindow, 'dns.resolve', CNAME_HOST, [ 'canonical_name' ]),
+            };
+        });
+
+        // CNAME uncloaking: the image's hostname is not filtered, its CNAME is.
+        await section('cname', async ( ) => {
+            const record = report.dns && report.dns.cname && report.dns.cname.value;
+            report.cname = { canonicalName: record && record.canonicalName || null };
+            if ( (report.cname.canonicalName || '').endsWith(`.${CNAME_DOMAIN}`) === false ) { return; }
+            const page = await openTab(`${base}/cname.html`);
+            report.cname.image = page.doc.documentElement.dataset.cname || 'not settled';
+            report.cname.uboCanonicalName =
+                Cu.waiveXrays(bgWindow).vAPI.net.canonicalNameFromHostname(CNAME_HOST) || null;
+            // uBO counts its requests a moment after it has filtered them.
+            const tabId = ext.tabTracker.getId(page.tab.linkedBrowser);
+            report.cname.blockedOnPage = await waitFor(( ) => {
+                const pageStore = µb.pageStoreFromTabId(tabId);
+                return pageStore ? pageStore.counts.blocked.any : null;
+            }, 5000, 'the blocked count').catch(( ) => 0);
+            page.close();
+        });
+
+        // A stream filter for no request fails, with an event.
+        await section('streamFilter', async ( ) => {
+            const page = Cu.waiveXrays(bgWindow);
+            const filter = Cu.waiveXrays(page.browser.webRequest.filterResponseData('uxp-no-such-request'));
+            report.streamFilterError = await new Promise(resolve => {
+                filter.onerror = Cu.exportFunction(( ) => {
+                    resolve({ status: filter.status, error: filter.error });
+                }, page);
+                setTimeout(( ) => { resolve({ status: filter.status, error: 'no error event' }); }, 5000);
+            });
+        });
+
+        await section('privacy', async ( ) => {
+            report.privacyPrefs = Object.fromEntries([
+                'network.prefetch-next', 'network.dns.disablePrefetch',
+                'network.http.speculative-parallel-limit', 'network.predictor.enabled',
+                'browser.send_pings',
+            ].map(name => [ name, readAnyPref(name) ]));
+            const get = name => callBackground(bgWindow, `privacy.${name}.get`, {})
+                .then(r => r.error !== undefined ? r : r.value);
+            report.privacyAPI = {
+                networkPredictionEnabled: await get('network.networkPredictionEnabled'),
+                hyperlinkAuditingEnabled: await get('websites.hyperlinkAuditingEnabled'),
+            };
+            report.privacyStored = Object.keys(JSON.parse(readAnyPref('extensions.ublock0.privacySettings') || '{}'));
+            // A setting set, then cleared: its pref comes back to what it was.
+            const referrers = 'websites.referrersEnabled';
+            const pref = 'network.http.sendRefererHeader';
+            report.privacyClear = { before: await get(referrers) };
+            report.privacyClear.set = (await callBackground(bgWindow, `privacy.${referrers}.set`, { value: false })).value;
+            report.privacyClear.prefWhenSet = readAnyPref(pref);
+            report.privacyClear.cleared = (await callBackground(bgWindow, `privacy.${referrers}.clear`, {})).value;
+            report.privacyClear.prefUserSetAfter = Services.prefs.prefHasUserValue(pref);
+            report.privacyClear.after = await get(referrers);
+        });
+
+        // Last, as it restarts the extension: stopping it gives the user's
+        // values back (as when it is disabled), starting it applies uBO's
+        // again.
+        headers.stop();
+        headers = null;
+        await section('privacyRestore', async ( ) => {
+            // One of the prefs uBO sets, whose default in this browser is
+            // not what uBO sets.
+            const [ pref, uboValue ] = [
+                [ 'network.prefetch-next', false ],
+                [ 'network.dns.disablePrefetch', true ],
+                [ 'network.predictor.enabled', false ],
+                [ 'network.http.speculative-parallel-limit', 0 ],
+            ].find(([ name, value ]) => {
+                const defaultValue = readDefaultPref(name);
+                return defaultValue !== null && defaultValue !== value;
+            }) || [];
+            if ( pref === undefined ) {
+                report.privacyRestore = { skipped: 'every pref already defaults to what uBO sets' };
+                return;
+            }
+            const changes = [];
+            const observer = {
+                observe: ( ) => { changes.push(readAnyPref(pref)); },
+            };
+            Services.prefs.addObserver(pref, observer, false);
+            try {
+                const before = extension;
+                Cu.waiveXrays(bgWindow).browser.runtime.reload();
+                await waitFor(( ) => extension !== null && extension !== before, 30000, 'the extension to restart');
+                await whenUBOReady();
+            } finally {
+                Services.prefs.removeObserver(pref, observer);
+            }
+            report.privacyRestore = {
+                pref,
+                defaultValue: readDefaultPref(pref),
+                uboValue,
+                changes,
+                final: readAnyPref(pref),
+            };
+        });
+    } catch (ex) {
+        failure = String(ex);
+    }
+    if ( headers !== null ) { headers.stop(); }
+    server.stop();
+
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const served = path => server.requests.some(r => r.endsWith(path));
+    const page = report.page || {};
+    checks.htmlFiltering = pass(page.htmlRemoved === true && page.htmlKept === true && page.inlineScriptRan === false, page);
+    const gzip = report.gzip || {};
+    checks.htmlFilteringGzip = gzip.encoded === false
+        ? 'SKIP: no gzip converter'
+        : pass(gzip.htmlRemoved === true && gzip.htmlKept === true, gzip);
+    checks.replace = pass(page.replaced === 'uxpAfter', page.replaced);
+    checks.redirect = pass(page.redirect === 'loaded' && page.redirectedScriptRan === false && served('/redirect.js') === false,
+        [ page.redirect, page.redirectedScriptRan, served('/redirect.js') ]);
+    const war = report.webAccessible || {};
+    checks.webAccessible = pass(war.withSecret === 'loaded' && war.withoutSecret === 'error' && war.notWebAccessible === 'error', war);
+    checks.header = pass(page.header === 'error' && page.headerScriptRan === false, [ page.header, page.headerScriptRan ]);
+    const csp = report.csp || {};
+    checks.csp = pass(csp.scriptRan === false && /script-src 'none'/.test(csp.header || ''), csp);
+    const permissions = report.permissions || {};
+    checks.permissions = pass(/geolocation=\(\)/.test(permissions.header || ''), permissions);
+    const strict = report.strict || {};
+    checks.strictBlocking = pass(strict.isDocumentBlocked === true && strict.extensionPrincipal === true && served('/strict.html') === false,
+        [ strict, served('/strict.html') ]);
+    const dns = report.dns || {};
+    checks.dns = pass(
+        dns.localhost && dns.localhost.value && dns.localhost.value.addresses.length !== 0 &&
+        dns.unknownHost && dns.unknownHost.error === 'NS_ERROR_UNKNOWN_HOST',
+        [ dns.localhost, dns.unknownHost ]);
+    const cname = report.cname || {};
+    checks.cnameUncloaking = cname.image === undefined
+        ? `SKIP: no ${CNAME_DOMAIN} CNAME for ${CNAME_HOST} here (${JSON.stringify(dns.cname)})`
+        : pass(cname.image === 'error' && (cname.uboCanonicalName || '').endsWith(CNAME_DOMAIN) && cname.blockedOnPage >= 1, cname);
+    const streamError = report.streamFilterError || {};
+    checks.streamFilterError = pass(streamError.status === 'failed' && streamError.error === 'Invalid request ID', streamError);
+    const prefs = report.privacyPrefs || {};
+    const api = report.privacyAPI || {};
+    const controlledOff = s => s !== undefined && s.value === false && s.levelOfControl === 'controlled_by_this_extension';
+    checks.privacySettings = pass(
+        prefs['network.prefetch-next'] === false && prefs['network.dns.disablePrefetch'] === true &&
+        prefs['network.http.speculative-parallel-limit'] === 0 && prefs['network.predictor.enabled'] !== true &&
+        prefs['browser.send_pings'] === false &&
+        controlledOff(api.networkPredictionEnabled) && controlledOff(api.hyperlinkAuditingEnabled),
+        [ prefs, api ]);
+    const clear = report.privacyClear || {};
+    checks.privacyClear = pass(
+        clear.set === true && clear.prefWhenSet === 0 && clear.cleared === true &&
+        clear.prefUserSetAfter === false && clear.after !== undefined && clear.after.value === true &&
+        clear.after.levelOfControl === 'controllable_by_this_extension',
+        clear);
+    // The pref goes back to the browser's default, then to uBO's value.
+    const restore = report.privacyRestore || {};
+    checks.privacyRestore = restore.skipped !== undefined
+        ? `SKIP: ${restore.skipped}`
+        : pass(
+            Array.isArray(restore.changes) && restore.changes.includes(restore.defaultValue) &&
+            restore.final === restore.uboValue,
+            restore);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        page: report.page,
+        webAccessible: report.webAccessible,
+        csp: report.csp,
+        permissions: report.permissions,
+        strict: report.strict,
+        cname: report.cname,
+        privacyStored: report.privacyStored,
+        privacyRestore: report.privacyRestore,
+        sectionErrors: report.errors,
+        serverRequests: server.requests,
         ownErrors: ownErrors(consoleLines),
     };
     if ( failure !== null ) {
@@ -1663,13 +2076,24 @@ const scenarios = {
     network: runNetwork,
     cosmetic: runCosmetic,
     ui: runUI,
+    filtering: runFiltering,
 };
 
-// Filters given to uBO through managed storage.
+// Filters and user settings given to uBO through managed storage.
 const SCENARIO_FILTERS = {
     network: NETWORK_FILTERS,
     cosmetic: COSMETIC_FILTERS,
     ui: UI_FILTERS,
+    filtering: FILTERING_FILTERS,
+};
+const SCENARIO_USER_SETTINGS = {
+    filtering: FILTERING_USER_SETTINGS,
+};
+
+// Test pages served under a name of their own (network.dns.localDomains).
+const SCENARIO_HOSTS = {
+    cosmetic: COSMETIC_HOST,
+    filtering: FILTERING_HOST,
 };
 
 const runScenario = async function(name) {
@@ -1751,14 +2175,17 @@ const start = function(data, reason) {
         if ( SCENARIO_FILTERS[scenario] !== undefined ) {
             managed.toOverwrite = { filters: SCENARIO_FILTERS[scenario] };
         }
+        if ( SCENARIO_USER_SETTINGS[scenario] !== undefined ) {
+            managed.userSettings = SCENARIO_USER_SETTINGS[scenario];
+        }
         Services.prefs.setCharPref(PREF_MANAGED_STORAGE, JSON.stringify(managed));
     }
     if ( scenario === 'network' ) {
         // Let the test page's window.open() through the popup blocker.
         Services.prefs.setBoolPref('dom.disable_open_during_load', false);
     }
-    if ( scenario === 'cosmetic' ) {
-        Services.prefs.setCharPref('network.dns.localDomains', COSMETIC_HOST);
+    if ( SCENARIO_HOSTS[scenario] !== undefined ) {
+        Services.prefs.setCharPref('network.dns.localDomains', SCENARIO_HOSTS[scenario]);
     }
     runScenario(scenario);
 };

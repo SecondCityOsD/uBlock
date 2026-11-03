@@ -56,6 +56,7 @@ Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
         'api-webrequest.js',
         'api-content.js',
         'api-ui.js',
+        'api-network.js',
     ];
     for ( const script of scripts ) {
         Services.scriptloader.loadSubScript(`${base}${script}`, this, 'UTF-8');
@@ -471,6 +472,9 @@ const ExtensionProtocol = class {
 // Which of the extension's files others may load: web_accessible_resources
 // only, as in Firefox (where the protocol handler's per-URL flags say so).
 // The browser, the extension's pages and its content scripts may load any.
+// A web page's load of a web-accessible resource goes through the
+// extension's webRequest.onBeforeRequest listeners, which may cancel it
+// (see api-webrequest.js, onResourceLoad()).
 
 const WebAccessiblePolicy = class {
     constructor(extension) {
@@ -525,8 +529,25 @@ const WebAccessiblePolicy = class {
         const { ACCEPT, REJECT_REQUEST } = Ci.nsIContentPolicy;
         if ( location.schemeIs('moz-extension') === false ) { return ACCEPT; }
         if ( location.host !== this.extension.uuid ) { return ACCEPT; }
-        if ( this.extension.webAccessible.matches(location.spec) ) { return ACCEPT; }
-        return this.isPrivileged(requestOrigin, requestPrincipal) ? ACCEPT : REJECT_REQUEST;
+        if ( this.isPrivileged(requestOrigin, requestPrincipal) ) { return ACCEPT; }
+        if ( this.extension.webAccessible.matches(location.spec) === false ) { return REJECT_REQUEST; }
+        // Gecko checks a document load twice, from the docshell and then for
+        // the load itself: the listeners see it once (uBO's secrets are
+        // single-use).
+        if ( extra instanceof Ci.nsISupportsString && extra.data === 'conPolCheckFromDocShell' ) {
+            return ACCEPT;
+        }
+        const { webRequest } = this.extension;
+        if ( webRequest === null ) { return ACCEPT; }
+        try {
+            const cancelled = webRequest.onResourceLoad(
+                contentType, location, requestOrigin, context, requestPrincipal
+            );
+            return cancelled ? REJECT_REQUEST : ACCEPT;
+        } catch (ex) {
+            Cu.reportError(ex);
+        }
+        return ACCEPT;
     }
 
     shouldProcess() {
@@ -678,16 +699,16 @@ var Extension = class {
             )
         );
         this.registerOrigin();
-        // Created in dependency order (webRequest uses the tab tracker,
+        // Created in dependency order: webRequest uses the tab tracker,
         // content scripts the tab tracker and messaging, the browser UI the
-        // tab tracker); merged core first, so implementations override its
-        // placeholders.
+        // tab tracker.
         const tabs = createTabsAPIs(this);
         const webRequest = createWebRequestAPIs(this);
         this.coreAPIs = createCoreAPIs(this);
         const content = createContentAPIs(this);
         const ui = createUIAPIs(this);
-        this.apiModules = [ this.coreAPIs, tabs, webRequest, content, ui ];
+        const network = createNetworkAPIs(this);
+        this.apiModules = [ this.coreAPIs, tabs, webRequest, content, ui, network ];
         Services.obs.addObserver(this, 'document-element-inserted', false);
         Services.obs.addObserver(this, 'inner-window-destroyed', false);
         Services.console.registerListener(this.consoleListener);

@@ -18,8 +18,7 @@
 
 */
 
-// browser.runtime, browser.i18n, browser.storage, browser.alarms -- plus
-// placeholders for the namespaces later phases implement (see PLAN.md).
+// browser.runtime, browser.i18n, browser.storage and browser.alarms.
 //
 // Loaded into Extension.jsm's global (see there).
 
@@ -632,45 +631,6 @@ const acceptLanguages = function() {
 
 /******************************************************************************/
 
-// Namespaces upstream touches at load time but which later phases implement
-// (see PLAN.md): correctly shaped, events never fire, functions report once
-// to the console.
-
-const createPlaceholders = function() {
-    const reported = new Set();
-    const report = name => {
-        if ( reported.has(name) ) { return; }
-        reported.add(name);
-        Services.console.logStringMessage(`uBlock0 UXP: browser.${name}() is not implemented yet`);
-    };
-    const notYet = (name, result) => apiAsync(( ) => {
-        report(name);
-        return result;
-    });
-    const setting = name => ({
-        get: notYet(`${name}.get`, { value: undefined, levelOfControl: 'not_controllable' }),
-        set: notYet(`${name}.set`, false),
-        clear: notYet(`${name}.clear`, false),
-        onChange: new EventManager(`${name}.onChange`),
-    });
-
-    return {
-        privacy: {
-            network: {
-                networkPredictionEnabled: setting('privacy.network.networkPredictionEnabled'),
-                peerConnectionEnabled: setting('privacy.network.peerConnectionEnabled'),
-                webRTCIPHandlingPolicy: setting('privacy.network.webRTCIPHandlingPolicy'),
-            },
-            websites: {
-                hyperlinkAuditingEnabled: setting('privacy.websites.hyperlinkAuditingEnabled'),
-                referrersEnabled: setting('privacy.websites.referrersEnabled'),
-            },
-        },
-    };
-};
-
-/******************************************************************************/
-
 const createCoreAPIs = function(extension) {
     const messaging = new Messaging(extension);
     const storage = new StorageService(extension);
@@ -709,7 +669,7 @@ const createCoreAPIs = function(extension) {
     };
 
     // Built once: Extension.buildAPI() never modifies a module's tree.
-    const pageTree = Object.assign({
+    const pageTree = {
         runtime: Object.assign({
             getPlatformInfo: apiAsync(( ) => platformInfo()),
             getBrowserInfo: apiAsync(( ) => ({
@@ -730,7 +690,7 @@ const createCoreAPIs = function(extension) {
             clearAll: apiAsync(( ) => alarms.clearAll()),
             onAlarm: alarms.onAlarm,
         },
-    }, createPlaceholders());
+    };
     const contentTree = { runtime: contentRuntime, i18n };
 
     return {
