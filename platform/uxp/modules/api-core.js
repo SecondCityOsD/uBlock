@@ -636,7 +636,7 @@ const acceptLanguages = function() {
 // (see PLAN.md): correctly shaped, events never fire, functions report once
 // to the console.
 
-const createPlaceholders = function(extension) {
+const createPlaceholders = function() {
     const reported = new Set();
     const report = name => {
         if ( reported.has(name) ) { return; }
@@ -647,44 +647,14 @@ const createPlaceholders = function(extension) {
         report(name);
         return result;
     });
-    const events = (namespace, names) => Object.fromEntries(
-        names.map(name => [ name, new EventManager(`${namespace}.${name}`) ])
-    );
     const setting = name => ({
         get: notYet(`${name}.get`, { value: undefined, levelOfControl: 'not_controllable' }),
         set: notYet(`${name}.set`, false),
         clear: notYet(`${name}.clear`, false),
         onChange: new EventManager(`${name}.onChange`),
     });
-    const menus = {
-        create: apiSync((context, properties) => {
-            report('menus.create');
-            return properties && properties.id;
-        }),
-        update: notYet('menus.update'),
-        remove: notYet('menus.remove'),
-        removeAll: notYet('menus.removeAll'),
-        refresh: notYet('menus.refresh'),
-        ...events('menus', [ 'onClicked', 'onShown', 'onHidden' ]),
-    };
-    const commands = extension.manifest.commands || {};
 
     return {
-        browserAction: {
-            setTitle: notYet('browserAction.setTitle'),
-            getTitle: notYet('browserAction.getTitle', ''),
-            setIcon: notYet('browserAction.setIcon'),
-            setBadgeText: notYet('browserAction.setBadgeText'),
-            getBadgeText: notYet('browserAction.getBadgeText', ''),
-            setBadgeBackgroundColor: notYet('browserAction.setBadgeBackgroundColor'),
-            setBadgeTextColor: notYet('browserAction.setBadgeTextColor'),
-            setPopup: notYet('browserAction.setPopup'),
-            enable: notYet('browserAction.enable'),
-            disable: notYet('browserAction.disable'),
-            onClicked: new EventManager('browserAction.onClicked'),
-        },
-        menus,
-        contextMenus: menus,
         privacy: {
             network: {
                 networkPredictionEnabled: setting('privacy.network.networkPredictionEnabled'),
@@ -695,16 +665,6 @@ const createPlaceholders = function(extension) {
                 hyperlinkAuditingEnabled: setting('privacy.websites.hyperlinkAuditingEnabled'),
                 referrersEnabled: setting('privacy.websites.referrersEnabled'),
             },
-        },
-        commands: {
-            getAll: apiAsync(( ) => Object.entries(commands).map(([ name, command ]) => ({
-                name,
-                description: extension.localizeString(command.description || ''),
-                shortcut: '',
-            }))),
-            update: notYet('commands.update'),
-            reset: notYet('commands.reset'),
-            onCommand: new EventManager('commands.onCommand'),
         },
     };
 };
@@ -770,7 +730,7 @@ const createCoreAPIs = function(extension) {
             clearAll: apiAsync(( ) => alarms.clearAll()),
             onAlarm: alarms.onAlarm,
         },
-    }, createPlaceholders(extension));
+    }, createPlaceholders());
     const contentTree = { runtime: contentRuntime, i18n };
 
     return {

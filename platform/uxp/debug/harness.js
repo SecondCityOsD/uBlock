@@ -27,6 +27,8 @@
 //             'network'  ... check network filtering, from browser launch on
 //             'cosmetic' ... check cosmetic filters, scriptlets, and the
 //                        content-script APIs
+//             'ui'       ... check the toolbar button, popup, context menu
+//                        and keyboard shortcuts
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -1301,6 +1303,343 @@ const runCosmetic = async function() {
 
 /******************************************************************************/
 
+// UI: the toolbar button with uBO's badge; its popup, opened from the
+// button and closed by the popup itself; the context menu (uBO's items,
+// "Block element" starting the element picker); a keyboard shortcut set
+// through commands.update(); the Options button in about:addons and
+// runtime.openOptionsPage(), each opening uBO's dashboard in a tab.
+// Screenshots of the toolbar and the popup go next to the report.
+
+const UI_FILTERS = [ '||127.0.0.1^*/uxp-blocked/' ];
+
+const uiRoutes = function(path, port) {
+    if ( path !== '/ui.html' ) { return testRoutes(path, port); }
+    return {
+        type: 'text/html; charset=utf-8',
+        body: `<!doctype html><html><head><meta charset="utf-8"><title>uxp-ui</title></head><body>
+<img id="okImage" src="/ok/image.svg"><img id="adImage" src="/uxp-blocked/ad.svg">
+<p><a id="subscribe" href="abp:subscribe?location=https%3A%2F%2Fexample.com%2Flist.txt&amp;title=Example">subscribe</a></p>
+<div id="target" style="width: 200px; height: 100px; background: #ccc">target</div>
+</body></html>`,
+    };
+};
+
+// A PNG of `rect` in `target` (a chrome or a content window), drawn with
+// the privileges of the browser window `win`.
+const saveScreenshot = function(win, target, rect, name) {
+    const canvas = win.document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');
+    canvas.width = Math.max(1, Math.ceil(rect.width));
+    canvas.height = Math.max(1, Math.ceil(rect.height));
+    canvas.getContext('2d').drawWindow(
+        target, rect.left, rect.top, rect.width, rect.height, 'rgb(255,255,255)'
+    );
+    const bytes = win.atob(canvas.toDataURL('image/png').split(',')[1]);
+    const file = outDir.clone();
+    file.append(name);
+    const stream = Cc['@mozilla.org/network/file-output-stream;1']
+        .createInstance(Ci.nsIFileOutputStream);
+    stream.init(file, 0x02 | 0x08 | 0x20, 0o644, 0);
+    const binary = Cc['@mozilla.org/binaryoutputstream;1']
+        .createInstance(Ci.nsIBinaryOutputStream);
+    binary.setOutputStream(stream);
+    binary.writeBytes(bytes, bytes.length);
+    stream.close();
+    return file.path;
+};
+
+// Opens the content area's context menu on `element`; resolves with the
+// labels of uBO's items in it ("menu > item" inside a submenu).
+const openContextMenu = async function(win, element) {
+    const menu = win.document.getElementById('contentAreaContextMenu');
+    const shown = new Promise(resolve => {
+        menu.addEventListener('popupshown', resolve, { once: true });
+    });
+    const rect = element.getBoundingClientRect();
+    element.ownerDocument.defaultView
+        .QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsIDOMWindowUtils)
+        .sendMouseEvent('contextmenu', rect.left + 5, rect.top + 5, 2, 1, 0);
+    await Promise.race([ shown, sleep(5000) ]);
+    const labels = [];
+    const items = [];
+    for ( const node of menu.querySelectorAll('[data-ublock0-menu] menuitem, menuitem[data-ublock0-menu], menu[data-ublock0-menu]') ) {
+        if ( node.localName === 'menu' ) { continue; }
+        const parent = node.parentNode.parentNode;
+        labels.push(parent.localName === 'menu'
+            ? `${parent.getAttribute('label')} > ${node.getAttribute('label')}`
+            : node.getAttribute('label'));
+        items.push(node);
+    }
+    return { menu, labels, items };
+};
+
+const runUI = async function() {
+    const report = {};
+    const checks = {};
+    let failure = null;
+    const server = new TestServer(uiRoutes);
+    server.start();
+    try {
+        const { ext, bgWindow, µb } = await whenUBOReady();
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const page = await openTab(`http://127.0.0.1:${server.port}/ui.html`);
+        const tabId = ext.tabTracker.getId(page.tab.linkedBrowser);
+
+        // Toolbar button and badge
+        const button = await waitFor(( ) =>
+            win.document.querySelector('[id="uBlock0-legacy-button"], [id="ublock0-button"]'),
+            10000, 'the toolbar button'
+        );
+        const badge = await waitFor(( ) => button.getAttribute('badge'), 10000, 'the badge')
+            .catch(( ) => '');
+        report.button = {
+            id: button.id,
+            parent: button.parentNode ? button.parentNode.id : null,
+            label: button.getAttribute('label'),
+            badge,
+            icon: button.style.getPropertyValue('--ublock0-icon'),
+        };
+        report.badgeFromAPI = (await callBackground(bgWindow, 'browserAction.getBadgeText', { tabId })).value;
+        const pageStore = µb.pageStoreFromTabId(tabId);
+        report.blockedOnPage = pageStore ? pageStore.counts.blocked.any : null;
+        const navbar = win.document.getElementById('nav-bar');
+        report.toolbarScreenshot = saveScreenshot(win, win, navbar.getBoundingClientRect(), 'toolbar.png');
+
+        // Web pages may load web-accessible resources (the element picker,
+        // redirect= filters), not the rest of the package. The page's own
+        // script loads them: a load started from here would be the
+        // browser's.
+        const pageLoads = async path => {
+            const key = `load${path.replace(/\W/g, '')}`;
+            const script = page.doc.createElement('script');
+            script.textContent = `{
+                const img = new Image();
+                img.onload = ( ) => { document.documentElement.dataset.${key} = 'true'; };
+                img.onerror = ( ) => { document.documentElement.dataset.${key} = 'false'; };
+                img.src = ${JSON.stringify(ext.getURL(path))};
+            }`;
+            page.doc.body.appendChild(script);
+            return waitFor(( ) => page.doc.documentElement.dataset[key], 5000, path)
+                .then(result => result === 'true', ( ) => 'timeout');
+        };
+        report.webAccessible = {
+            'web_accessible_resources/1x1.gif': await pageLoads('web_accessible_resources/1x1.gif'),
+            'img/icon_16.png': await pageLoads('img/icon_16.png'),
+        };
+
+        // Each part on its own: a failure does not hide the next parts.
+        const section = async (name, fn) => {
+            try {
+                await fn();
+            } catch (ex) {
+                report.errors = report.errors || {};
+                report.errors[name] = String(ex);
+            }
+        };
+
+        // Basilisk moves the view into a panelmultiview's anonymous content,
+        // which document.querySelector() does not search.
+        const findPopupBrowser = ( ) => {
+            const selector = '.ublock0-popup-browser';
+            const view = win.document.getElementById('ublock0-panel');
+            return win.document.querySelector(selector) || view && view.querySelector(selector);
+        };
+
+        await section('popup', async ( ) => {
+            button.doCommand();
+            const popupBrowser = await waitFor(findPopupBrowser, 5000, 'the popup'
+            ).catch(ex => {
+                const view = win.document.getElementById('ublock0-panel');
+                report.popupDebug = {
+                    view: view ? `in ${view.parentNode && view.parentNode.id}` : 'none',
+                    panels: Array.from(win.document.querySelectorAll('panel'))
+                        .filter(p => p.state !== 'closed')
+                        .map(p => `${p.id || p.className}: ${p.state}`),
+                };
+                throw ex;
+            });
+            const popupDoc = await waitFor(( ) => {
+                const d = popupBrowser.contentDocument;
+                if ( !d || d.readyState !== 'complete' || !d.body ) { return null; }
+                if ( d.body.classList.contains('loading') ) { return null; }
+                const hostname = d.getElementById('hostname');
+                return hostname && hostname.textContent.trim() !== '' ? d : null;
+            // uBO may be busy updating its lists after a first install.
+            }, 30000, 'the popup page');
+            await sleep(500);
+            const popupRect = popupBrowser.getBoundingClientRect();
+            report.popup = {
+                url: popupDoc.documentURI,
+                width: Math.round(popupRect.width),
+                height: Math.round(popupRect.height),
+                // uBO puts soft hyphens in hostnames, as line break points.
+                hostname: popupDoc.getElementById('hostname').textContent.replace(/­/g, '').trim(),
+                layout: popupDoc.documentElement.className,
+            };
+            report.popupScreenshot = saveScreenshot(win, popupDoc.defaultView, {
+                left: 0, top: 0, width: popupRect.width, height: popupRect.height,
+            }, 'popup.png');
+            Cu.waiveXrays(popupDoc.defaultView).vAPI.closePopup();
+            report.popupClosedItself = await waitFor(( ) =>
+                findPopupBrowser() === null, 5000, 'the popup to close'
+            ).catch(( ) => false);
+            report.browserWindowStillOpen = win.closed === false;
+        });
+
+        // A popup left open would take the context menu's clicks.
+        for ( const panel of win.document.querySelectorAll('panel') ) {
+            if ( panel.state === 'open' ) { panel.hidePopup(); }
+        }
+
+        // Context menu: on a link to subscribe to a list, then on an element
+        await section('menus', async ( ) => {
+            const onLink = await openContextMenu(win, page.doc.getElementById('subscribe'));
+            report.menuOnSubscribeLink = onLink.labels;
+            onLink.menu.hidePopup();
+            await sleep(300);
+            const onElement = await openContextMenu(win, page.doc.getElementById('target'));
+            report.menuOnElement = onElement.labels;
+            if ( onElement.items.length !== 0 ) {
+                onElement.items[0].doCommand();
+            }
+            onElement.menu.hidePopup();
+            report.pickerStarted = await waitFor(( ) =>
+                Array.from(page.doc.querySelectorAll('iframe'), f => f.contentDocument ? f.contentDocument.documentURI : 'no document')
+                    .some(url => url.includes('/epicker-ui.html')), 10000, 'the element picker'
+            ).catch(( ) => false);
+            report.pageFrames = Array.from(page.doc.querySelectorAll('iframe'), f => f.contentDocument ? f.contentDocument.documentURI : 'no document');
+        });
+
+        // Keyboard shortcut
+        await section('shortcut', async ( ) => {
+            report.commands = (await callBackground(bgWindow, 'commands.getAll')).value;
+            report.shortcutUpdate = await callBackground(bgWindow, 'commands.update', {
+                name: 'launch-logger',
+                shortcut: 'Alt+Shift+L',
+            });
+            const key = win.document.querySelector('#ublock0-commands > key');
+            report.shortcutKey = key
+                ? `${key.getAttribute('modifiers')} ${key.getAttribute('key')}`
+                : 'none';
+            if ( key ) { key.doCommand(); }
+            const loggerTab = await waitFor(( ) =>
+                openTabs().find(t => t.linkedBrowser.currentURI.spec.includes('logger-ui.html')),
+                10000, 'the logger'
+            ).catch(( ) => null);
+            report.loggerOpened = loggerTab !== null;
+            if ( loggerTab !== null ) {
+                const loggerWindow = loggerTab.ownerGlobal;
+                if ( loggerWindow.gBrowser.tabs.length === 1 ) {
+                    loggerWindow.close();
+                } else {
+                    loggerWindow.gBrowser.removeTab(loggerTab);
+                }
+            }
+            await callBackground(bgWindow, 'commands.reset', 'launch-logger');
+            report.shortcutAfterReset = win.document.getElementById('ublock0-commands') === null
+                ? 'none'
+                : 'still there';
+        });
+
+        // Options: about:addons' Options button opens the dashboard in a
+        // tab, and so does runtime.openOptionsPage(). The dashboard keeps
+        // its pane in the URL's fragment.
+        await section('options', async ( ) => {
+            const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+            const dashboardURL = ext.getURL('dashboard.html');
+            const dashboardTabs = ( ) => openTabs().filter(t =>
+                t.linkedBrowser.currentURI.specIgnoringRef === dashboardURL
+            );
+            // A selected dashboard tab whose page has uBO's API.
+            const dashboardOpened = ( ) => waitFor(( ) => {
+                const tab = dashboardTabs().find(t => t.ownerGlobal.gBrowser.selectedTab === t);
+                const d = tab && tab.linkedBrowser.contentDocument;
+                return d && d.readyState === 'complete' &&
+                    typeof Cu.waiveXrays(d.defaultView).vAPI === 'object';
+            }, 15000, 'the dashboard').catch(( ) => false);
+            const closeDashboards = ( ) => {
+                for ( const tab of dashboardTabs() ) {
+                    tab.ownerGlobal.gBrowser.removeTab(tab);
+                }
+            };
+            const addon = await new Promise(resolve => { AddonManager.getAddonByID(ext.id, resolve); });
+            report.addonOptions = {
+                inTab: addon.optionsType === AddonManager.OPTIONS_TYPE_TAB,
+                isDashboard: addon.optionsURL === dashboardURL,
+                type: addon.optionsType,
+                url: addon.optionsURL,
+            };
+            const options = report.options = {};
+            win.BrowserOpenAddonsMgr('addons://list/extension');
+            const manager = await waitFor(( ) => {
+                const tab = openTabs().find(t => t.linkedBrowser.currentURI.spec.startsWith('about:addons'));
+                const w = tab && tab.linkedBrowser.contentWindow;
+                const view = w && w.gViewController && w.gViewController.currentViewObj;
+                const item = view && typeof view.getListItemForID === 'function'
+                    ? view.getListItemForID(ext.id)
+                    : null;
+                return item ? { tab, doc: w.document, item } : null;
+            }, 10000, 'the Add-ons Manager');
+            const optionsButton = manager.doc.getAnonymousElementByAttribute(
+                manager.item, 'anonid', 'preferences-btn'
+            );
+            options.button = optionsButton === null ? 'none' : optionsButton.hidden ? 'hidden' : 'shown';
+            optionsButton.doCommand();
+            options.fromAddonsManager = await dashboardOpened();
+            closeDashboards();
+            manager.tab.ownerGlobal.gBrowser.removeTab(manager.tab);
+            options.openOptionsPage = await callBackground(bgWindow, 'runtime.openOptionsPage');
+            options.fromAPI = await dashboardOpened();
+            closeDashboards();
+        });
+        page.close();
+    } catch (ex) {
+        failure = String(ex);
+    }
+    server.stop();
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { button, popup } = report;
+    checks.button = pass(button && /^nav-bar/.test(button.parent || ''), button && button.parent);
+    checks.badge = pass(button && /^[1-9]\d*$/.test(button.badge) && button.badge === report.badgeFromAPI,
+        button && [ button.badge, report.badgeFromAPI ]);
+    checks.popup = pass(popup && popup.hostname === '127.0.0.1' && popup.width > 100 && popup.height > 100, popup);
+    checks.popupClosedItself = pass(report.popupClosedItself === true && report.browserWindowStillOpen, report.popupClosedItself);
+    checks.menuOnSubscribeLink = pass((report.menuOnSubscribeLink || []).length === 2, report.menuOnSubscribeLink);
+    checks.menuOnElement = pass((report.menuOnElement || []).length === 1, report.menuOnElement);
+    checks.pickerStarted = pass(report.pickerStarted === true, report.pickerStarted);
+    checks.commands = pass(Array.isArray(report.commands) && report.commands.length === 8, report.commands);
+    checks.shortcut = pass(report.shortcutKey === 'alt,shift L' && report.loggerOpened, [ report.shortcutKey, report.loggerOpened ]);
+    checks.shortcutReset = pass(report.shortcutAfterReset === 'none', report.shortcutAfterReset);
+    checks.webAccessible = pass(report.webAccessible && report.webAccessible['web_accessible_resources/1x1.gif'] === true && report.webAccessible['img/icon_16.png'] === false, report.webAccessible);
+    const { addonOptions, options = {} } = report;
+    checks.addonOptions = pass(addonOptions && addonOptions.inTab && addonOptions.isDashboard && options.button === 'shown',
+        [ addonOptions, options.button ]);
+    checks.optionsButton = pass(options.fromAddonsManager === true, options.fromAddonsManager);
+    checks.openOptionsPage = pass(options.openOptionsPage && options.openOptionsPage.error === undefined &&
+        options.fromAPI === true, [ options.openOptionsPage, options.fromAPI ]);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        button: report.button,
+        popup: report.popup,
+        options: report.options,
+        menuOnSubscribeLink: report.menuOnSubscribeLink,
+        menuOnElement: report.menuOnElement,
+        sectionErrors: report.errors,
+        popupDebug: report.popupDebug,
+        pageFrames: report.pageFrames,
+        screenshots: [ report.toolbarScreenshot, report.popupScreenshot ].filter(Boolean),
+        placeholdersHit: placeholdersHit(consoleLines),
+        ownErrors: ownErrors(consoleLines),
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -1323,12 +1662,14 @@ const scenarios = {
     boot: runBoot,
     network: runNetwork,
     cosmetic: runCosmetic,
+    ui: runUI,
 };
 
 // Filters given to uBO through managed storage.
 const SCENARIO_FILTERS = {
     network: NETWORK_FILTERS,
     cosmetic: COSMETIC_FILTERS,
+    ui: UI_FILTERS,
 };
 
 const runScenario = async function(name) {

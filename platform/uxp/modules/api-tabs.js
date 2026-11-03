@@ -190,6 +190,34 @@ const TabTracker = class {
         this.windowWatcher = {
             observe: (subject, topic) => { this.onWindowWatcher(subject, topic); },
         };
+        this.chromeObservers = new Set();
+    }
+
+    // Runtime parts which add to the browser windows' UI (api-ui.js) follow
+    // them through these optional methods: onWindowAttached(win),
+    // onWindowDetached(win), onTabSelected(tab), onTabNavigated(tab) (a new
+    // document in the tab), onTabRemoved(tabId). A new observer is told of
+    // the windows already attached.
+    addChromeObserver(observer) {
+        this.chromeObservers.add(observer);
+        for ( const win of this.windows ) {
+            this.notifyChrome('onWindowAttached', [ win ], observer);
+        }
+    }
+
+    removeChromeObserver(observer) {
+        this.chromeObservers.delete(observer);
+    }
+
+    notifyChrome(method, args, only = null) {
+        for ( const observer of only !== null ? [ only ] : this.chromeObservers ) {
+            if ( typeof observer[method] !== 'function' ) { continue; }
+            try {
+                observer[method](...args);
+            } catch (ex) {
+                Cu.reportError(ex);
+            }
+        }
     }
 
     start() {
@@ -377,10 +405,13 @@ const TabTracker = class {
             this.attachBrowser(tab.linkedBrowser);
         }
         this.selectedTabIds.set(win, this.getId(gBrowser.selectedBrowser));
+        this.notifyChrome('onWindowAttached', [ win ]);
     }
 
     detachWindow(win) {
-        if ( this.windows.delete(win) === false ) { return; }
+        if ( this.windows.has(win) === false ) { return; }
+        this.notifyChrome('onWindowDetached', [ win ]);
+        this.windows.delete(win);
         const gBrowser = win.gBrowser;
         for ( const type of [ 'TabOpen', 'TabClose', 'TabSelect', 'TabMove', 'TabPinned', 'TabUnpinned' ] ) {
             gBrowser.tabContainer.removeEventListener(type, this);
@@ -428,6 +459,7 @@ const TabTracker = class {
         for ( const tab of Array.from(win.gBrowser.tabs) ) {
             const tabId = this.getId(tab.linkedBrowser);
             this.tabEvents.onRemoved.fire(tabId, { windowId, isWindowClosing: true });
+            this.notifyChrome('onTabRemoved', [ tabId ]);
             this.browsers.delete(tabId);
         }
         this.detachWindow(win);
@@ -446,6 +478,7 @@ const TabTracker = class {
                 windowId: this.windowIdOf(tab.ownerGlobal),
                 isWindowClosing: false,
             });
+            this.notifyChrome('onTabRemoved', [ tabId ]);
             this.browsers.delete(tabId);
             this.detachBrowser(tab.linkedBrowser);
             break;
@@ -525,6 +558,7 @@ const TabTracker = class {
         if ( previousTabId !== undefined && previousTabId !== tabId ) {
             details.previousTabId = previousTabId;
         }
+        this.notifyChrome('onTabSelected', [ tab ]);
         this.tabEvents.onActivated.fire(details);
     }
 
@@ -681,6 +715,12 @@ const TabTracker = class {
                 event.fire(Object.assign(nav.details, this.transitionOf(webProgress, request, isTopLevel)));
             }
         } else if ( isTopLevel ) {
+            // First: the extension then sets its toolbar state for the new
+            // document.
+            const tab = this.tabForBrowser(nav.browser);
+            if ( tab !== null ) {
+                this.notifyChrome('onTabNavigated', [ tab ]);
+            }
             this.navigationEvents.onCommitted.fire(Object.assign(
                 {},
                 nav.details,
