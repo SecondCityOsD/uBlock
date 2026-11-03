@@ -26,6 +26,9 @@
 // holds exactly what uBO's Firefox XPI holds, plus the UXP overlay:
 //   tools/copy-common-files.sh, tools/make-firefox.sh,
 //   tools/make-firefox-meta.py, tools/make-assets.sh
+// One exception: constructs UXP's JavaScript engine runs far slower than
+// Firefox's are rewritten in the package's copy, behavior unchanged
+// (tools/uxp-compat.mjs).
 //
 // A release build also writes dist/update.rdf, the update manifest that
 // offers it (PLAN.md, "Releasing").
@@ -39,6 +42,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
+import { rewriteSuperCalls } from './uxp-compat.mjs';
 import zlib from 'node:zlib';
 
 /******************************************************************************/
@@ -152,6 +156,31 @@ const assembleUpstream = des => {
     copyMatching(path.join(UPSTREAM, 'platform', 'firefox'), /\.js$/, path.join(des, 'js'));
     copyDir(path.join(des, '_locales', 'nb'), path.join(des, '_locales', 'no'));
     fs.rmSync(path.join(des, 'img', 'icon_128.png'));
+};
+
+// tools/uxp-compat.mjs over upstream's scripts, before the UXP overlay. A
+// file that can't be rewritten ships as it is: slower, not wrong.
+const rewriteForUXP = des => {
+    const summary = { rewritten: 0, files: 0, kept: 0, failed: [] };
+    for ( const rel of listFiles(des) ) {
+        if ( rel.endsWith('.js') === false ) { continue; }
+        const file = path.join(des, rel);
+        const source = fs.readFileSync(file, 'utf8');
+        if ( /\bsuper\b/.test(source) === false ) { continue; }
+        let result;
+        try {
+            result = rewriteSuperCalls(source);
+        } catch (ex) {
+            summary.failed.push(`${rel}: ${ex.message}`);
+            continue;
+        }
+        summary.kept += result.kept.length;
+        if ( result.rewritten === 0 ) { continue; }
+        fs.writeFileSync(file, result.code);
+        summary.rewritten += result.rewritten;
+        summary.files += 1;
+    }
+    return summary;
 };
 
 // tools/make-firefox-meta.py
@@ -393,6 +422,7 @@ const main = async ( ) => {
 
     const assets = await bundleAssets(BUILD, version, options);
     assembleUpstream(BUILD);
+    const compat = rewriteForUXP(BUILD);
     const manifest = writeFirefoxMeta(BUILD, version);
     overlayPlatform(BUILD, options);
     writeInstallRdf(BUILD, manifest, emVersion, options);
@@ -406,6 +436,10 @@ const main = async ( ) => {
     const size = (fs.statSync(xpiPath).size / 1048576).toFixed(2);
     console.log(`Built ${path.relative(ROOT, xpiPath)} (${names.length} files, ${size} MB)`);
     console.log(`  upstream ${version}, em:version ${emVersion}, ${options.debug ? 'debug' : 'release'}`);
+    console.log(`  UXP rewrites: ${compat.rewritten} super calls in ${compat.files} files (${compat.kept} other uses of super left as they are)`);
+    for ( const entry of compat.failed ) {
+        console.warn(`  WARNING: not rewritten: ${entry}`);
+    }
     if ( options.noAssets ) {
         console.log('  filter lists: not bundled (--no-assets)');
     } else {
