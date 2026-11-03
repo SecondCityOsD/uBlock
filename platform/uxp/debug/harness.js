@@ -39,6 +39,7 @@
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
 
+/* global indexedDB */
 /* exported harness */
 
 'use strict';
@@ -80,7 +81,7 @@ const getPref = function(name, fallback) {
         case prefs.PREF_INT: return prefs.getIntPref(name);
         case prefs.PREF_STRING: return prefs.getCharPref(name);
         }
-    } catch (ex) {
+    } catch {
     }
     return fallback;
 };
@@ -92,7 +93,7 @@ const readAnyPref = function(name) {
         case Services.prefs.PREF_INT: return Services.prefs.getIntPref(name);
         case Services.prefs.PREF_STRING: return Services.prefs.getCharPref(name);
         }
-    } catch (ex) {
+    } catch {
     }
     return null;
 };
@@ -106,7 +107,7 @@ const readDefaultPref = function(name) {
         case branch.PREF_INT: return branch.getIntPref(name);
         case branch.PREF_STRING: return branch.getCharPref(name);
         }
-    } catch (ex) {
+    } catch {
     }
     return null;
 };
@@ -138,7 +139,7 @@ const record = function(kind, text, source = '', keep = true) {
     const where = source !== '' ? ` @ ${source}` : '';
     try {
         writeText('console.log', `${time} [${kind}] ${text}${where}\n`, true);
-    } catch (ex) {
+    } catch {
     }
 };
 
@@ -176,7 +177,7 @@ const stringify = function(value) {
     try {
         const json = JSON.stringify(value);
         if ( json !== undefined ) { return json; }
-    } catch (ex) {
+    } catch {
     }
     return String(value);
 };
@@ -362,7 +363,7 @@ const evaluateIn = function(win, table) {
     for ( const [ name, expr ] of Object.entries(table) ) {
         try {
             out[name] = Boolean(new win.Function(`return (${expr});`)());
-        } catch (ex) {
+        } catch {
             out[name] = false;
         }
     }
@@ -373,9 +374,9 @@ const parseIn = function(win, table) {
     const out = {};
     for ( const [ name, source ] of Object.entries(table) ) {
         try {
-            new win.Function(source); // eslint-disable-line no-new-func
+            new win.Function(source); // compiled, never run
             out[name] = true;
-        } catch (ex) {
+        } catch {
             out[name] = false;
         }
     }
@@ -390,7 +391,7 @@ const resourceExists = function(url) {
             : channel.open();
         stream.close();
         return true;
-    } catch (ex) {
+    } catch {
         return false;
     }
 };
@@ -417,7 +418,7 @@ const probeEnvironment = function(win) {
     let remoteTabs = null;
     try {
         remoteTabs = appinfo.browserTabsRemoteAutostart;
-    } catch (ex) {
+    } catch {
     }
     return {
         appName: appinfo.name,
@@ -449,7 +450,7 @@ const probeMozExtension = function() {
         // Throws NS_ERROR_NOT_AVAILABLE when flags are computed per URI.
         try {
             out.protocolFlags = handler.protocolFlags;
-        } catch (ex) {
+        } catch {
             out.protocolFlags = 'dynamic';
         }
     } catch (ex) {
@@ -538,7 +539,7 @@ const loadPage = function(url) {
                 if ( pageDoc !== null && pageDoc.documentURI === url ) {
                     readyState = pageDoc.readyState;
                 }
-            } catch (ex) {
+            } catch {
             }
             const now = Date.now();
             if ( readyState === 'interactive' && interactiveSince === 0 ) {
@@ -571,7 +572,7 @@ const probePage = async function(url) {
     try {
         const p = iframe.contentDocument.nodePrincipal;
         principal = Services.scriptSecurityManager.isSystemPrincipal(p) ? 'system' : p.origin;
-    } catch (ex) {
+    } catch {
     }
     return { url, readyState, principal, iframe, messages };
 };
@@ -683,7 +684,7 @@ const waitFor = async function(fn, timeout, what) {
         let value = null;
         try {
             value = fn();
-        } catch (ex) {
+        } catch {
         }
         if ( value ) { return value; }
         if ( Date.now() > deadline ) {
@@ -776,11 +777,11 @@ const runBoot = async function() {
         const page = await openTab(url);
         report.dashboard = { url, principal: page.doc.nodePrincipal.origin };
         try {
-            report.dashboard.listEntries = await waitFor(( ) =>
-                page.doc.querySelectorAll('.listEntry[data-key]').length,
+            report.dashboard.listEntries = await waitFor(
+                ( ) => page.doc.querySelectorAll('.listEntry[data-key]').length,
                 15000, 'lists rendered in 3p-filters.html'
             );
-        } catch (ex) {
+        } catch {
             report.dashboard.listEntries = 0;
         }
         report.contexts = Array.from(ext.contexts.values(), c => `${c.viewType}: ${c.url}`);
@@ -930,7 +931,7 @@ const TestServer = class {
                         .createInstance(Ci.nsIScriptableInputStream);
                     scriptable.init(stream);
                     received += scriptable.read(stream.available());
-                } catch (ex) {
+                } catch {
                     input.close();
                     output.close();
                     return;
@@ -1311,7 +1312,7 @@ const runCosmetic = async function() {
         const expected = JSON.stringify(COSMETIC_EXPECTED);
         try {
             await waitFor(( ) => JSON.stringify(cosmeticState(doc)) === expected, 15000, 'the cosmetic filters');
-        } catch (ex) {
+        } catch {
         }
         for ( const topic of documentTopics ) {
             Services.obs.removeObserver(documentObserver, topic);
@@ -1436,8 +1437,8 @@ const runUI = async function() {
         const tabId = ext.tabTracker.getId(page.tab.linkedBrowser);
 
         // Toolbar button and badge
-        const button = await waitFor(( ) =>
-            win.document.querySelector('[id="uBlock0-legacy-button"], [id="ublock0-button"]'),
+        const button = await waitFor(
+            ( ) => win.document.querySelector('[id="uBlock0-legacy-button"], [id="ublock0-button"]'),
             10000, 'the toolbar button'
         );
         const badge = await waitFor(( ) => button.getAttribute('badge'), 10000, 'the badge')
@@ -1500,8 +1501,9 @@ const runUI = async function() {
                 left: 0, top: 0, width: popupRect.width, height: popupRect.height,
             }, 'popup.png');
             Cu.waiveXrays(popupDoc.defaultView).vAPI.closePopup();
-            report.popupClosedItself = await waitFor(( ) =>
-                findPopupBrowser() === null, 5000, 'the popup to close'
+            report.popupClosedItself = await waitFor(
+                ( ) => findPopupBrowser() === null,
+                5000, 'the popup to close'
             ).catch(( ) => false);
             report.browserWindowStillOpen = win.closed === false;
         });
@@ -1523,11 +1525,14 @@ const runUI = async function() {
                 onElement.items[0].doCommand();
             }
             onElement.menu.hidePopup();
-            report.pickerStarted = await waitFor(( ) =>
-                Array.from(page.doc.querySelectorAll('iframe'), f => f.contentDocument ? f.contentDocument.documentURI : 'no document')
-                    .some(url => url.includes('/epicker-ui.html')), 10000, 'the element picker'
+            const frameURLs = ( ) => Array.from(page.doc.querySelectorAll('iframe'),
+                f => f.contentDocument ? f.contentDocument.documentURI : 'no document'
+            );
+            report.pickerStarted = await waitFor(
+                ( ) => frameURLs().some(url => url.includes('/epicker-ui.html')),
+                10000, 'the element picker'
             ).catch(( ) => false);
-            report.pageFrames = Array.from(page.doc.querySelectorAll('iframe'), f => f.contentDocument ? f.contentDocument.documentURI : 'no document');
+            report.pageFrames = frameURLs();
         });
 
         // Keyboard shortcut
@@ -1542,8 +1547,8 @@ const runUI = async function() {
                 ? `${key.getAttribute('modifiers')} ${key.getAttribute('key')}`
                 : 'none';
             if ( key ) { key.doCommand(); }
-            const loggerTab = await waitFor(( ) =>
-                openTabs().find(t => t.linkedBrowser.currentURI.spec.includes('logger-ui.html')),
+            const loggerTab = await waitFor(
+                ( ) => openTabs().find(t => t.linkedBrowser.currentURI.spec.includes('logger-ui.html')),
                 10000, 'the logger'
             ).catch(( ) => null);
             report.loggerOpened = loggerTab !== null;
@@ -1591,6 +1596,8 @@ const runUI = async function() {
             };
             const options = report.options = {};
             win.BrowserOpenAddonsMgr('addons://list/extension');
+            // A generous wait: uBO's first update cycle runs about now, and
+            // compiling a fresh list blocks the main thread for seconds.
             const manager = await waitFor(( ) => {
                 const tab = openTabs().find(t => t.linkedBrowser.currentURI.spec.startsWith('about:addons'));
                 const w = tab && tab.linkedBrowser.contentWindow;
@@ -1599,7 +1606,7 @@ const runUI = async function() {
                     ? view.getListItemForID(ext.id)
                     : null;
                 return item ? { tab, doc: w.document, item } : null;
-            }, 10000, 'the Add-ons Manager');
+            }, 30000, 'the Add-ons Manager');
             const optionsButton = manager.doc.getAnonymousElementByAttribute(
                 manager.item, 'anonid', 'preferences-btn'
             );
@@ -1693,7 +1700,7 @@ const gzipOf = function(text) {
     try {
         converter = Cc['@mozilla.org/streamconv;1?from=uncompressed&to=gzip']
             .createInstance(Ci.nsIStreamConverter);
-    } catch (ex) {
+    } catch {
         return null;
     }
     const chunks = [];
@@ -2114,7 +2121,7 @@ const leftovers = async function(addonId, uuid) {
     try {
         const { CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {});
         buttonPlacement = CustomizableUI.getPlacementOfWidget('ublock0-button', false, true);
-    } catch (ex) {
+    } catch {
         const doc = 'chrome://browser/content/browser.xul';
         const store = Cc['@mozilla.org/xul/xulstore;1'].getService(Ci.nsIXULStore);
         const ids = store.getIDsEnumerator(doc);
@@ -2224,7 +2231,7 @@ const whenBrowserReady = async function() {
             const win = Services.wm.getMostRecentWindow('navigator:browser');
             ready = hiddenDoc && hiddenDoc.readyState === 'complete' &&
                 win && win.document.readyState === 'complete';
-        } catch (ex) {
+        } catch {
         }
         if ( ready ) { break; }
         await sleep(250);
@@ -2315,7 +2322,7 @@ const start = function(data, reason) {
 
     const scenario = getPref('scenario', '');
     if ( scenario === '' ) { return; }
-    if ( scenarios.hasOwnProperty(scenario) === false ) {
+    if ( Object.hasOwn(scenarios, scenario) === false ) {
         log(`unknown scenario "${scenario}"`);
         return;
     }

@@ -78,7 +78,7 @@ const parentFrameIdOf = win => win.top === win ? -1 : frameIdOf(win.parent);
 const documentURLOf = function(win) {
     try {
         return win.document.documentURI;
-    } catch (ex) {
+    } catch {
     }
     return '';
 };
@@ -100,7 +100,7 @@ const requestURLOf = function(request) {
             }
         }
         return uri.spec;
-    } catch (ex) {
+    } catch {
     }
     return '';
 };
@@ -112,7 +112,7 @@ const docShellOf = function(browser) {
     try {
         const webProgress = browser.webProgress;
         return { webProgress, key: webProgress.DOMWindow };
-    } catch (ex) {
+    } catch {
     }
     return null;
 };
@@ -252,7 +252,7 @@ const TabTracker = class {
         let gBrowser;
         try {
             gBrowser = browser.ownerGlobal && browser.ownerGlobal.gBrowser;
-        } catch (ex) {
+        } catch {
         }
         if ( !gBrowser ) { return null; }
         if ( typeof gBrowser.getTabForBrowser === 'function' ) {
@@ -281,7 +281,7 @@ const TabTracker = class {
                 .getInterface(Ci.nsIWebNavigation)
                 .QueryInterface(Ci.nsIDocShell)
                 .chromeEventHandler;
-        } catch (ex) {
+        } catch {
         }
         return null;
     }
@@ -323,7 +323,7 @@ const TabTracker = class {
         let loading = false;
         try {
             loading = pending === false && browser.webProgress.isLoadingDocument;
-        } catch (ex) {
+        } catch {
         }
         return {
             id: this.getId(browser),
@@ -441,7 +441,7 @@ const TabTracker = class {
         if ( docShell === null || this.listenedDocShells.delete(docShell.key) === false ) { return; }
         try {
             docShell.webProgress.removeProgressListener(this.progressListener);
-        } catch (ex) {
+        } catch {
         }
     }
 
@@ -534,7 +534,7 @@ const TabTracker = class {
         let opener = null;
         try {
             opener = browser.contentWindow && browser.contentWindow.opener;
-        } catch (ex) {
+        } catch {
         }
         if ( !opener ) { return; }
         const sourceTabId = this.tabIdForBrowser(this.browserForContentWindow(opener));
@@ -606,7 +606,7 @@ const TabTracker = class {
         let win;
         try {
             win = webProgress.DOMWindow;
-        } catch (ex) {
+        } catch {
             return null;
         }
         const browser = this.browserForContentWindow(win);
@@ -629,7 +629,7 @@ const TabTracker = class {
         let loadType = 0;
         try {
             loadType = webProgress.loadType;
-        } catch (ex) {
+        } catch {
         }
         const transitionQualifiers = [];
         let transitionType = isTopLevel ? 'link' : 'auto_subframe';
@@ -643,7 +643,7 @@ const TabTracker = class {
             if ( request.QueryInterface(Ci.nsIChannel).loadInfo.redirectChain.length !== 0 ) {
                 transitionQualifiers.push('server_redirect');
             }
-        } catch (ex) {
+        } catch {
         }
         return { transitionType, transitionQualifiers };
     }
@@ -673,7 +673,7 @@ const TabTracker = class {
             let win;
             try {
                 win = webProgress.DOMWindow;
-            } catch (ex) {
+            } catch {
                 return;
             }
             const nav = this.navigationDetails(webProgress, documentURLOf(win));
@@ -703,7 +703,7 @@ const TabTracker = class {
             let loadType = 0;
             try {
                 loadType = webProgress.loadType;
-            } catch (ex) {
+            } catch {
             }
             let event = null;
             if ( pathChanged === false && hashChanged ) {

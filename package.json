@@ -1,0 +1,19 @@
+{
+  "name": "ublock-uxp",
+  "private": true,
+  "description": "uBlock Origin for UXP: development tools",
+  "type": "module",
+  "scripts": {
+    "lint": "eslint"
+  },
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=22",
+    "npm": ">=11"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.34.0",
+    "eslint": "^9.34.0",
+    "globals": "^15.15.0"
+  }
+}

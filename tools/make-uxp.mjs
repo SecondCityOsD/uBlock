@@ -32,10 +32,10 @@
 //   --no-assets       don't bundle filter lists (uBO fetches them at runtime)
 //   --refresh-assets  re-download the bundled filter lists
 
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { fileURLToPath } from 'node:url';
 
 /******************************************************************************/
 

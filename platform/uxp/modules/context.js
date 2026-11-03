@@ -70,7 +70,7 @@ const originOf = function(principal) {
     try {
         if ( principal.isNullPrincipal ) { return 'null'; }
         return principal.originNoSuffix;
-    } catch (ex) {
+    } catch {
     }
     return 'null';
 };

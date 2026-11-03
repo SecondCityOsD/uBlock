@@ -471,7 +471,7 @@ const StorageService = class {
             store = JSON.parse(
                 Services.prefs.getComplexValue(PREF_MANAGED_STORAGE, Ci.nsISupportsString).data
             );
-        } catch (ex) {
+        } catch {
         }
         if ( store === null || typeof store !== 'object' ) {
             throw new ExtensionError('Managed storage manifest not found');
@@ -630,7 +630,7 @@ const acceptLanguages = function() {
             'intl.accept_languages',
             Ci.nsIPrefLocalizedString
         ).data;
-    } catch (ex) {
+    } catch {
     }
     return languages.split(',').map(s => s.trim()).filter(s => s !== '');
 };

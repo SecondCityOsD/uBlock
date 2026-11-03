@@ -58,7 +58,7 @@ const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {}
 let CustomizableUI = null;
 try {
     ({ CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {}));
-} catch (ex) {
+} catch {
 }
 
 const hasOwn = (o, key) => Object.prototype.hasOwnProperty.call(o, key);
@@ -114,7 +114,7 @@ const iconSetOf = function(extension, paths, baseURL) {
         let url = '';
         try {
             url = Services.io.newURI(path, null, Services.io.newURI(baseURL, null, null)).spec;
-        } catch (ex) {
+        } catch {
         }
         if ( extension.isOwnURL(url) || url.startsWith('data:image/') ) {
             out.push([ n, url ]);
@@ -145,7 +145,7 @@ const ownURLOf = function(extension, path, baseURL) {
     let url = '';
     try {
         url = Services.io.newURI(path, null, Services.io.newURI(baseURL, null, null)).spec;
-    } catch (ex) {
+    } catch {
     }
     if ( extension.isOwnURL(url) === false ) {
         throw new ExtensionError(`Not an extension page: ${path}`);
@@ -236,7 +236,7 @@ const PopupView = class {
         try {
             browser.docShell.contentViewer.getContentSize(width, height);
             ratio = browser.contentWindow.devicePixelRatio || 1;
-        } catch (ex) {
+        } catch {
             return;
         }
         const size = (value, max) => Math.min(Math.max(Math.ceil(value / ratio), 1), max);
@@ -251,7 +251,7 @@ const PopupView = class {
         if ( this.observer !== null ) {
             try {
                 this.observer.disconnect();
-            } catch (ex) {
+            } catch {
             }
             this.observer = null;
         }
@@ -326,7 +326,7 @@ const PaleMoonButton = class {
         let placed = false;
         try {
             placed = Services.prefs.getBoolPref(PREF_BUTTON_PLACED);
-        } catch (ex) {
+        } catch {
         }
         const navbar = doc.getElementById('nav-bar');
         if ( placed || navbar === null || typeof navbar.insertItem !== 'function' ) { return; }
@@ -568,7 +568,7 @@ const BrowserAction = class {
         this.host.detachWindow(win);
         try {
             windowUtilsOf(win).removeSheetUsingURIString(this.styleURI, AUTHOR_SHEET);
-        } catch (ex) {
+        } catch {
         }
     }
 
@@ -759,7 +759,7 @@ const ContextMenus = class {
         let icons = null;
         try {
             icons = iconSetOf(this.extension, manifest.icons, this.extension.getURL(''));
-        } catch (ex) {
+        } catch {
         }
         this.icons = icons;
     }
@@ -994,10 +994,14 @@ const ContextMenus = class {
         if ( cm.onAudio ) { contexts.add('audio'); }
         if ( contexts.size === 0 ) { contexts.add('page'); }
         contexts.add('all');
-        const mediaType = cm.onImage ? 'image'
-            : cm.onVideo ? 'video'
-            : cm.onAudio ? 'audio'
-            : undefined;
+        let mediaType;
+        if ( cm.onImage ) {
+            mediaType = 'image';
+        } else if ( cm.onVideo ) {
+            mediaType = 'video';
+        } else if ( cm.onAudio ) {
+            mediaType = 'audio';
+        }
         let selectionText;
         if ( cm.isTextSelected && win !== null ) {
             selectionText = String(win.getSelection());
@@ -1123,7 +1127,7 @@ const Commands = class {
         try {
             const stored = JSON.parse(Services.prefs.getCharPref(PREF_SHORTCUTS));
             if ( stored !== null && typeof stored === 'object' ) { this.overrides = stored; }
-        } catch (ex) {
+        } catch {
         }
     }
 
@@ -1259,7 +1263,7 @@ const OptionsPage = class {
         let database = null;
         try {
             database = Cu.import(XPI_PROVIDER_URL, {}).XPIDatabase;
-        } catch (ex) {
+        } catch {
         }
         if (
             database === null || typeof database !== 'object' ||

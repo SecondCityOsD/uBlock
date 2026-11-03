@@ -59,7 +59,7 @@ const { AUTHOR_SHEET, USER_SHEET } = Ci.nsIDOMWindowUtils;
 const parseURL = function(spec) {
     try {
         return new URL(spec);
-    } catch (ex) {
+    } catch {
     }
     return null;
 };
@@ -121,7 +121,7 @@ const documentURLsOf = function(doc) {
     let principalURI = null;
     try {
         principalURI = doc.nodePrincipal.URI;
-    } catch (ex) {
+    } catch {
     }
     return {
         url: null,
@@ -141,7 +141,7 @@ const resultOf = function(frame, value) {
     }
     try {
         return frame.cloneIn(value);
-    } catch (ex) {
+    } catch {
         throw new ExtensionError(NOT_CLONEABLE);
     }
 };
@@ -170,7 +170,7 @@ const Sources = class {
         let url = '';
         try {
             url = Services.io.newURI(entry.file, null, Services.io.newURI(baseURL, null, null)).spec;
-        } catch (ex) {
+        } catch {
         }
         if ( this.extension.isOwnURL(url) === false ) {
             throw new ExtensionError(`Files to be injected must be within the extension: ${entry.file}`);
@@ -185,7 +185,7 @@ const Sources = class {
         if ( text === undefined ) {
             try {
                 text = this.extension.readPackageFile(source.path);
-            } catch (ex) {
+            } catch {
                 throw new ExtensionError(`Unable to load ${source.url}`);
             }
             this.files.set(source.path, text);
@@ -359,7 +359,7 @@ const ContentContext = class extends Context {
         try {
             shown = this.isCurrent &&
                 windowUtilsOf(window).currentInnerWindowID === this.innerWindowID;
-        } catch (ex) {
+        } catch {
         }
         this.stopWaiting();
         this.waiting = [];
@@ -375,7 +375,7 @@ const ContentContext = class extends Context {
             for ( const sheet of new Map(sheets.map(s => [ `${s.type}${s.uri}`, s ])).values() ) {
                 try {
                     utils.removeSheetUsingURIString(sheet.uri, sheet.type);
-                } catch (ex) {
+                } catch {
                 }
             }
         }

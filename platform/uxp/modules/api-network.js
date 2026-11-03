@@ -81,7 +81,7 @@ const resolveHostname = function(hostname, flags) {
                 if ( wantsCanonicalName ) {
                     try {
                         out.canonicalName = record.canonicalName;
-                    } catch (ex) {
+                    } catch {
                     }
                 }
                 while ( record.hasMore() ) {
@@ -210,7 +210,7 @@ const readPref = function(name) {
         case prefs.PREF_STRING: return prefs.getCharPref(name);
         default: break;
         }
-    } catch (ex) {
+    } catch {
     }
     return undefined;
 };
@@ -255,7 +255,7 @@ const PrivacySettings = class {
         let store = {};
         try {
             store = JSON.parse(Services.prefs.getCharPref(PREF_PRIVACY_SETTINGS));
-        } catch (ex) {
+        } catch {
         }
         if ( store === null || typeof store !== 'object' ) { return {}; }
         for ( const [ name, entry ] of Object.entries(store) ) {

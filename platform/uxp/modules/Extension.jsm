@@ -32,6 +32,10 @@
 // Firefox loaded its ext-*.js scripts: one compartment for the whole
 // runtime, no cross-compartment calls between its parts.
 
+/* global URL, Context, EventManager, PageValue, injectAPI, createCoreAPIs,
+          forgetCoreData, PREF_MANAGED_STORAGE, createTabsAPIs,
+          createWebRequestAPIs, createContentAPIs, createUIAPIs,
+          forgetBrowserUI, createNetworkAPIs */
 /* exported EXPORTED_SYMBOLS, Extension */
 
 'use strict';
@@ -98,7 +102,7 @@ var MatchPattern = class {
         let parsed;
         try {
             parsed = new URL(url);
-        } catch (ex) {
+        } catch {
             return false;
         }
         return this.matchesURL(parsed);
@@ -149,7 +153,7 @@ const savedUUID = function() {
     let uuid = '';
     try {
         uuid = Services.prefs.getCharPref(PREF_UUID);
-    } catch (ex) {
+    } catch {
     }
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid) ? uuid : '';
 };
@@ -170,11 +174,11 @@ const getUILocale = function() {
         return Cc['@mozilla.org/chrome/chrome-registry;1']
             .getService(Ci.nsIXULChromeRegistry)
             .getSelectedLocale('global');
-    } catch (ex) {
+    } catch {
     }
     try {
         return Services.prefs.getCharPref('general.useragent.locale');
-    } catch (ex) {
+    } catch {
     }
     return 'en-US';
 };
@@ -188,7 +192,7 @@ const whenHiddenWindowReady = async function(isCancelled) {
         let doc = null;
         try {
             doc = appShell.hiddenDOMWindow && appShell.hiddenDOMWindow.document;
-        } catch (ex) {
+        } catch {
         }
         if ( doc && doc.readyState === 'complete' ) { return true; }
         if ( isCancelled() ) { return false; }
@@ -206,7 +210,7 @@ var windowUtilsOf = win => win.QueryInterface(Ci.nsIInterfaceRequestor)
 var outerWindowIdOf = function(win) {
     try {
         return windowUtilsOf(win).outerWindowID;
-    } catch (ex) {
+    } catch {
     }
     return 0;
 };
@@ -268,7 +272,7 @@ const SlowScriptLimit = class {
         if ( this.saved === undefined ) {
             try {
                 this.saved = branch.getIntPref(SLOW_SCRIPT_PREF);
-            } catch (ex) {
+            } catch {
                 this.saved = null;
             }
             if ( Services.prefs.prefHasUserValue(SLOW_SCRIPT_PREF) ) {
@@ -598,7 +602,7 @@ const BackgroundPage = class {
         if ( own === null ) { return 0; }
         try {
             return windowUtilsOf(own).currentInnerWindowID;
-        } catch (ex) {
+        } catch {
         }
         return 0;
     }
@@ -948,7 +952,7 @@ var Extension = class {
         let json;
         try {
             json = JSON.parse(this.readPackageFile(`_locales/${locale}/messages.json`));
-        } catch (ex) {
+        } catch {
             return null;
         }
         const out = new Map();
@@ -1039,7 +1043,7 @@ var Extension = class {
 
     // Extension pages get the API before any of their scripts runs.
 
-    observe(subject, topic, data) {
+    observe(subject, topic) {
         switch ( topic ) {
         case 'document-element-inserted':
             this.onDocumentElementInserted(subject);

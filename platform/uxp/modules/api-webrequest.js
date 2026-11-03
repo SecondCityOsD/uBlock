@@ -40,9 +40,9 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, setTimeout, clearTimeout,
-          dispatch, MatchPattern, outerWindowIdOf, errorNameOf, EventManager,
-          ExtensionError, PageValue, apiSync, apiAsync */
+/* global Cc, Ci, Cr, Cu, Services, URL, XPCOMUtils, setTimeout,
+          clearTimeout, dispatch, MatchPattern, outerWindowIdOf, errorNameOf,
+          EventManager, ExtensionError, PageValue, apiSync, apiAsync */
 /* exported createWebRequestAPIs */
 
 'use strict';
@@ -108,7 +108,7 @@ const requestIdOf = function(channel) {
         const id = String(nextRequestId++);
         bag.setPropertyAsAString(REQUEST_ID_KEY, id);
         return id;
-    } catch (ex) {
+    } catch {
     }
     return String(nextRequestId++);
 };
@@ -121,7 +121,7 @@ const loadContextOf = function(channel) {
         try {
             const loadContext = callbacks().getInterface(Ci.nsILoadContext);
             if ( loadContext ) { return loadContext; }
-        } catch (ex) {
+        } catch {
         }
     }
     return null;
@@ -133,7 +133,7 @@ const headersOf = function(channel, visitMethod) {
         channel[visitMethod]({
             visitHeader(name, value) { out.push({ name, value }); },
         });
-    } catch (ex) {
+    } catch {
     }
     return out;
 };
@@ -147,7 +147,7 @@ const replaceHeaders = function(channel, headers, isResponse) {
             } else {
                 channel.setRequestHeader(name, value, merge);
             }
-        } catch (ex) {
+        } catch {
         }
     };
     const group = list => {
@@ -178,7 +178,7 @@ const proxyInfoOf = function(channel) {
     let info = null;
     try {
         info = channel.QueryInterface(Ci.nsIProxiedChannel).proxyInfo;
-    } catch (ex) {
+    } catch {
     }
     if ( !info || info.type === 'direct' ) { return null; }
     return {
@@ -197,15 +197,15 @@ const responseDetailsOf = function(channel) {
         const major = {}, minor = {};
         channel.QueryInterface(Ci.nsIHttpChannelInternal).getResponseVersion(major, minor);
         out.statusLine = `HTTP/${major.value}.${minor.value} ${channel.responseStatus} ${channel.responseStatusText}`;
-    } catch (ex) {
+    } catch {
     }
     try {
         out.fromCache = channel.QueryInterface(Ci.nsICacheInfoChannel).isFromCache();
-    } catch (ex) {
+    } catch {
     }
     try {
         out.ip = channel.QueryInterface(Ci.nsIHttpChannelInternal).remoteAddress;
-    } catch (ex) {
+    } catch {
     }
     return out;
 };
@@ -372,7 +372,7 @@ const StreamFilter = class {
                 .QueryInterface(Ci.nsITraceableChannel)
                 .setNewListener(this);
             return true;
-        } catch (ex) {
+        } catch {
         }
         return false;
     }
@@ -406,7 +406,7 @@ const StreamFilter = class {
         this.suspended = false;
         try {
             this.channel.resume();
-        } catch (ex) {
+        } catch {
         }
     }
 
@@ -588,7 +588,7 @@ const WebRequestService = class {
                 this.runRequestPhases(request, true);
             } catch (ex) {
                 Cu.reportError(ex);
-                try { request.channel.resume(); } catch (e) { }
+                try { request.channel.resume(); } catch { }
             }
         }
     }
@@ -597,7 +597,7 @@ const WebRequestService = class {
         let channel;
         try {
             channel = subject.QueryInterface(Ci.nsIHttpChannel);
-        } catch (ex) {
+        } catch {
             return;
         }
         try {
@@ -637,7 +637,7 @@ const WebRequestService = class {
             if ( loadContext && loadContext.topFrameElement ) {
                 return loadContext.topFrameElement;
             }
-        } catch (ex) {
+        } catch {
         }
         const windowId = loadInfo.frameOuterWindowID || loadInfo.outerWindowID;
         if ( windowId ) {
@@ -666,7 +666,7 @@ const WebRequestService = class {
             try {
                 const doc = loadInfo.loadingDocument;
                 if ( doc ) { documentUrl = doc.documentURI; }
-            } catch (ex) {
+            } catch {
             }
             if ( documentUrl === undefined && loadInfo.loadingPrincipal && loadInfo.loadingPrincipal.URI ) {
                 documentUrl = loadInfo.loadingPrincipal.URI.spec;
@@ -676,7 +676,7 @@ const WebRequestService = class {
         let incognito = false;
         try {
             incognito = loadInfo.originAttributes.privateBrowsingId > 0;
-        } catch (ex) {
+        } catch {
         }
         request.details = Object.assign({
             requestId: requestIdOf(channel),
@@ -706,7 +706,7 @@ const WebRequestService = class {
             let topWindowId = 0;
             try {
                 topWindowId = outerWindowIdOf(browser.contentWindow);
-            } catch (ex) {
+            } catch {
             }
             if ( windowId !== 0 && windowId !== topWindowId ) {
                 frameId = windowId;
@@ -790,7 +790,7 @@ const WebRequestService = class {
             if ( result.cancel === true ) {
                 try {
                     channel.cancel(Cr.NS_ERROR_ABORT);
-                } catch (ex) {
+                } catch {
                 }
                 return true;
             }
@@ -839,7 +839,7 @@ const WebRequestService = class {
             suspended = false;
             try {
                 request.channel.resume();
-            } catch (ex) {
+            } catch {
             }
         };
         const next = ( ) => {
@@ -886,7 +886,7 @@ const WebRequestService = class {
         }).then(( ) => {
             try {
                 channel.resume();
-            } catch (ex) {
+            } catch {
             }
         });
     }
@@ -898,7 +898,7 @@ const WebRequestService = class {
         try {
             const location = request.channel.getResponseHeader('Location');
             redirectUrl = Services.io.newURI(location, null, request.channel.URI).spec;
-        } catch (ex) {
+        } catch {
             return;
         }
         this.dispatch('onBeforeRedirect', request, Object.assign({ redirectUrl }, response));
@@ -915,7 +915,7 @@ const WebRequestService = class {
             listener.original = request.channel
                 .QueryInterface(Ci.nsITraceableChannel)
                 .setNewListener(listener);
-        } catch (ex) {
+        } catch {
             return;
         }
         // After a redirect, the new channel's request takes the same ID.
@@ -987,13 +987,13 @@ const WebRequestService = class {
             } else {
                 win = (node.ownerDocument || node).defaultView;
             }
-        } catch (ex) {
+        } catch {
         }
         const browser = win ? this.tracker.browserForContentWindow(win) : null;
         let incognito = false;
         try {
             incognito = requestPrincipal.originAttributes.privateBrowsingId > 0;
-        } catch (ex) {
+        } catch {
         }
         const details = Object.assign({
             requestId: String(nextRequestId++),

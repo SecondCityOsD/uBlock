@@ -31,10 +31,10 @@
 // running instances and real profiles are never touched. Executable paths
 // can be overridden with UXP_PALEMOON / UXP_BASILISK.
 
+import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 /******************************************************************************/
 
@@ -156,7 +156,7 @@ const killTree = function(child) {
         } else {
             child.kill('SIGKILL');
         }
-    } catch (ex) {
+    } catch {
     }
 };
 
