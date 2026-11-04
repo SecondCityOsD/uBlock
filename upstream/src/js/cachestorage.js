@@ -24,6 +24,9 @@
 import * as s14e from './s14e-serializer.js';
 
 import { ubolog } from './console.js';
+// [uBlock-UXP] platform/uxp/engine/client.js: the biggest IndexedDB writes
+// in a worker.
+import { storeEntries as uxpStoreEntries } from './uxp-engine.js';
 import webext from './webext.js';
 import µb from './background.js';
 
@@ -43,6 +46,29 @@ const keysFromGetArg = arg => {
 };
 
 let fastCache = 'indexedDB';
+
+// [uBlock-UXP] What uBO derives from the raw filter lists, and can always
+// derive again: compiled lists and selfies. When IndexedDB is the fast
+// cache, they go there as they are and nowhere else: their serialized
+// copy for storage.local, made in JavaScript on the main thread, froze the
+// browser for seconds (a compiled urlhaus weighs 73 MB; PLAN.md, Phase 6e
+// findings). If IndexedDB loses them, uBO compiles and builds again.
+const fastCacheOnly = key => /^cache\/(compiled|selfie)\//.test(key);
+
+// The keys of `rawbin` IndexedDB took and holds alone; none if it failed
+// to write them, for them to go where upstream puts them.
+const holdInFastCache = async function(rawbin, keys) {
+    const held = new Set();
+    if ( fastCache !== 'indexedDB' ) { return held; }
+    const bin = {};
+    for ( const key of keys ) {
+        if ( fastCacheOnly(key) ) { bin[key] = rawbin[key]; }
+    }
+    if ( Object.keys(bin).length === 0 ) { return held; }
+    if ( await idbStorage.set(bin) !== true ) { return held; }
+    for ( const key of Object.keys(bin) ) { held.add(key); }
+    return held;
+};
 
 /*******************************************************************************
  * 
@@ -150,15 +176,33 @@ const cacheStorage = (( ) => {
                 pendingWrite.set(key, rawbin[key]);
             }
             try {
+                // [uBlock-UXP] What IndexedDB holds alone is neither
+                // serialized nor written again; the copies storage.local
+                // has of it from earlier versions go.
+                const held = await holdInFastCache(rawbin, keys);
+                const rest = keys.filter(key => held.has(key) === false);
+                const restbin = {};
                 const serializedbin = {};
                 const promises = [];
-                for ( const key of keys ) {
+                for ( const key of rest ) {
+                    restbin[key] = rawbin[key];
+                    // [uBlock-UXP] Strings, the raw filter lists, go as they
+                    // are: storage.local is IndexedDB here, which compresses
+                    // them itself, off the main thread (serializing
+                    // urlhaus's 12 MB here froze the browser ~1 s). With
+                    // the Cache API as fast cache, which shares these
+                    // values, upstream's way.
+                    if ( typeof rawbin[key] === 'string' && fastCache !== 'cacheAPI' ) {
+                        serializedbin[key] = rawbin[key];
+                        continue;
+                    }
                     promises.push(compress(serializedbin, key, rawbin[key]));
                 }
                 await Promise.all(promises);
                 await Promise.all([
-                    cacheAPIs[fastCache].set(rawbin, serializedbin),
-                    extensionStorage.set(serializedbin),
+                    rest.length !== 0 ? cacheAPIs[fastCache].set(restbin, serializedbin) : undefined,
+                    rest.length !== 0 ? extensionStorage.set(serializedbin) : undefined,
+                    held.size !== 0 ? extensionStorage.remove(Array.from(held)) : undefined,
                 ]);
             } catch(reason) {
                 ubolog(reason);
@@ -604,21 +648,63 @@ const idbStorage = (( ) => {
         return outbin;
     };
 
+    // [uBlock-UXP] Compiled lists and selfies (fastCacheOnly()) are put by
+    // the engine's worker (platform/uxp/engine/client.js): put() serializes
+    // the value on the calling thread, ~14 ms per MB on Pale Moon, a second
+    // for urlhaus's compiled list. Until the worker's write of a key ends,
+    // the page writes or deletes nothing of that key, which would overtake
+    // it.
+    const workerWrites = new Map();
+
+    const afterWorkerWrites = keys => Promise.all(
+        keys.map(key => workerWrites.get(key)).filter(writing => writing !== undefined)
+    );
+
+    // Whether the worker wrote them.
+    const setEntriesInWorker = async function(inbin, keys) {
+        const writing = uxpStoreEntries(STORAGE_NAME, STORAGE_NAME,
+            keys.map(key => ({ key, value: inbin[key] }))
+        ).then(ok => ok === true, reason => {
+            ubolog(`idbStorage() / setEntriesInWorker() failed: ${reason}`);
+            return false;
+        });
+        for ( const key of keys ) {
+            workerWrites.set(key, writing);
+        }
+        const ok = await writing;
+        for ( const key of keys ) {
+            if ( workerWrites.get(key) === writing ) { workerWrites.delete(key); }
+        }
+        ubolog(`idbStorage() ${keys.join()} ${ok ? 'written in a worker' : 'not written in a worker'}`);
+        return ok;
+    };
+
     const setEntries = async inbin => {
-        const keys = Object.keys(inbin);
+        let keys = Object.keys(inbin);
         if ( keys.length === 0 ) { return; }
         const db = await getDb();
-        if ( db === null ) { return; }
+        if ( db === null ) { return false; }
+        // [uBlock-UXP] The biggest by the worker, the rest here (all of them
+        // if the worker failed); resolves with whether the entries were
+        // written (holdInFastCache()).
+        const big = keys.filter(fastCacheOnly);
+        if ( big.length !== 0 && await setEntriesInWorker(inbin, big) ) {
+            keys = keys.filter(key => fastCacheOnly(key) === false);
+            if ( keys.length === 0 ) { return true; }
+        }
+        await afterWorkerWrites(keys);
         return new Promise(resolve => {
             const entries = [];
             for ( const key of keys ) {
                 entries.push({ key, value: inbin[key] });
             }
             const transaction = db.transaction(STORAGE_NAME, 'readwrite');
-            transaction.oncomplete =
+            transaction.oncomplete = ( ) => {
+                resolve(true);
+            };
             transaction.onerror =
             transaction.onabort = ( ) => {
-                resolve();
+                resolve(false);
             };
             const table = transaction.objectStore(STORAGE_NAME);
             for ( const entry of entries ) {
@@ -632,6 +718,8 @@ const idbStorage = (( ) => {
     const deleteEntries = async arg => {
         const keys = Array.isArray(arg) ? arg.slice() : [ arg ];
         if ( keys.length === 0 ) { return; }
+        // [uBlock-UXP] After the worker's writes of these keys.
+        await afterWorkerWrites(keys);
         const db = await getDb();
         if ( db === null ) { return; }
         return new Promise(resolve => {
@@ -696,7 +784,8 @@ const idbStorage = (( ) => {
         },
 
         clear() {
-            return getDb().then(db => {
+            // [uBlock-UXP] Once the worker's writes ended.
+            return Promise.all(workerWrites.values()).then(( ) => getDb()).then(db => {
                 if ( db === null ) { return; }
                 db.close();
                 indexedDB.deleteDatabase(STORAGE_NAME);

@@ -826,6 +826,10 @@ const runBoot = async function() {
         scriptRunTimeAfterBoot: report.scriptRunTimeAfterBoot,
         backgroundRestarts: lines.filter(l => l.text.includes('was stopped; restarting it')).length,
         wasm: lines.some(l => l.text.includes('WASM modules ready')) ? 'enabled' : 'not enabled',
+        // On a relaunch (--keep-profile), uBO's saved engine, not a rebuild.
+        engine: lines.some(l => l.text.includes('Loaded filtering engine from selfie'))
+            ? 'loaded from its selfie'
+            : 'built from the filter lists',
         filterLists: Object.entries(report.lists || {}).map(([ k, v ]) => `${k}: ${v}`),
         dashboard: report.dashboard
             ? `${report.dashboard.listEntries} filter lists rendered, principal ${report.dashboard.principal}`
@@ -2560,6 +2564,56 @@ const stallsBetween = function(from, to) {
     };
 };
 
+// The bytes under `file`.
+const sizeOf = function(file) {
+    if ( file.exists() === false ) { return 0; }
+    if ( file.isDirectory() === false ) { return file.fileSize; }
+    let total = 0;
+    const entries = file.directoryEntries;
+    while ( entries.hasMoreElements() ) {
+        total += sizeOf(entries.getNext().QueryInterface(Ci.nsIFile));
+    }
+    return total;
+};
+
+// What uBO's data weighs on disk, in MB: its cache's IndexedDB (the
+// moz-extension origin's), and the browser's own IndexedDB, which holds
+// storage.local and whatever else chrome code keeps there.
+const storageSizes = function() {
+    const storage = Services.dirsvc.get('ProfD', Ci.nsIFile);
+    storage.append('storage');
+    const origins = storage.clone();
+    origins.append('default');
+    let cache = 0;
+    if ( origins.exists() ) {
+        const entries = origins.directoryEntries;
+        while ( entries.hasMoreElements() ) {
+            const entry = entries.getNext().QueryInterface(Ci.nsIFile);
+            if ( entry.leafName.startsWith('moz-extension+++') ) { cache += sizeOf(entry); }
+        }
+    }
+    const chrome = storage.clone();
+    chrome.append('permanent');
+    chrome.append('chrome');
+    const mb = bytes => Math.round(bytes / 10485.76) / 100;
+    return { uboCacheMB: mb(cache), chromeIndexedDBMB: mb(sizeOf(chrome)) };
+};
+
+// The keys the add-on's storage.local holds (api-core.js), or null.
+const storageLocalKeys = addonId => new Promise(resolve => {
+    const request = indexedDB.open(`uxp-webext-storage:${addonId}`, 1);
+    request.onsuccess = ( ) => {
+        const db = request.result;
+        const keys = db.transaction('local', 'readonly').objectStore('local').getAllKeys();
+        keys.onsuccess = ( ) => { db.close(); resolve(keys.result); };
+        keys.onerror = ( ) => { db.close(); resolve(null); };
+    };
+    request.onerror = event => {
+        event.preventDefault();
+        resolve(null);
+    };
+});
+
 // A µBlock method of the background page, its Promise awaited.
 const callUBO = function(bgWindow, path, ...args) {
     const page = Cu.waiveXrays(bgWindow);
@@ -2624,8 +2678,20 @@ const runStalls = async function() {
         from = Date.now();
         report.selfie = await callUBO(bgWindow, 'selfieManager.create');
         report.selfie.durationMs = Date.now() - from;
-        await sleep(2000);
+        // uBO lists what its cache holds in a registry it saves 3 s after
+        // a write, and reads nothing it doesn't list: a relaunch of this
+        // profile (boot --keep-profile) loads this selfie only after that.
+        await sleep(5000);
         Object.assign(report.selfie, stallsBetween(from, Date.now()));
+
+        // What uBO's data weighs in the profile, and what of its cache
+        // storage.local holds: compiled lists and selfies are IndexedDB's
+        // alone (cachestorage.js, fastCacheOnly()).
+        report.storage = storageSizes();
+        const keys = await storageLocalKeys(addonData.id);
+        report.storage.derivedInStorageLocal = keys === null
+            ? null
+            : keys.filter(key => /^cache\/(compiled|selfie)\//.test(key));
     } catch (ex) {
         failure = String(ex);
     }
@@ -2636,6 +2702,12 @@ const runStalls = async function() {
     // Every list compiled: on the first install, and urlhaus's update.
     report.compiledBy = compiledWhere(0).map(({ key, where }) => `${key} ${where}`);
     const compiledOnPage = report.compiledBy.filter(t => t.endsWith(' in a worker') === false);
+    // Every compiled list and selfie written to IndexedDB (cachestorage.js,
+    // setEntriesInWorker()).
+    report.storedBy = consoleLines
+        .filter(l => /idbStorage\(\) \S+ (not )?written in a worker/.test(l.text))
+        .map(l => l.text.replace(/^\[uBO\] idbStorage\(\) /, ''));
+    const storedOnPage = report.storedBy.filter(t => t.includes('not written'));
     const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
     const { firstInstall = {}, reload = {}, update = {}, selfie = {} } = report;
     const sameCounts = after => after !== undefined && JSON.stringify(after) === JSON.stringify(reload.countsBefore);
@@ -2646,6 +2718,12 @@ const runStalls = async function() {
         updateCountsUnchanged: pass(sameCounts(update.countsAfter), update.countsAfter),
         reloadNoFreeze: pass(reload.longestStallMs < 300, reload.longest),
         selfieNoFreeze: pass(selfie.longestStallMs < 300, selfie.longest),
+        storedInWorker: pass(report.storedBy.length !== 0 && storedOnPage.length === 0, storedOnPage),
+        derivedOnlyInIndexedDB: pass(
+            report.storage !== undefined && report.storage.derivedInStorageLocal !== null &&
+                report.storage.derivedInStorageLocal.length === 0,
+            report.storage && report.storage.derivedInStorageLocal
+        ),
     };
     const brief = phase => phase && {
         durationMs: phase.durationMs || phase.readyAfterMs,
@@ -2661,6 +2739,7 @@ const runStalls = async function() {
         update: brief(update),
         selfie: brief(selfie),
         builtBy: report.builtBy,
+        storage: report.storage,
     };
     if ( failure !== null ) {
         report.error = failure;

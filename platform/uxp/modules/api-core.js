@@ -393,7 +393,12 @@ const StorageService = class {
             const db = await this.database();
             const transaction = db.transaction(area, 'readwrite');
             const store = transaction.objectStore(area);
+            const observed = this.observed(area);
             for ( const [ key, value ] of entries ) {
+                if ( observed === false ) {
+                    store.put(value, key);
+                    continue;
+                }
                 const request = store.get(key);
                 request.onsuccess = ( ) => {
                     changes[key] = changeOf(request.result, value);
@@ -418,7 +423,12 @@ const StorageService = class {
             const db = await this.database();
             const transaction = db.transaction(area, 'readwrite');
             const store = transaction.objectStore(area);
+            const observed = this.observed(area);
             for ( const key of list ) {
+                if ( observed === false ) {
+                    store.delete(key);
+                    continue;
+                }
                 const request = store.get(key);
                 request.onsuccess = ( ) => {
                     if ( request.result === undefined ) { return; }
@@ -442,14 +452,18 @@ const StorageService = class {
             const db = await this.database();
             const transaction = db.transaction(area, 'readwrite');
             const store = transaction.objectStore(area);
-            const keysRequest = store.getAllKeys();
-            const valuesRequest = store.getAll();
-            valuesRequest.onsuccess = ( ) => {
-                keysRequest.result.forEach((key, i) => {
-                    changes[key] = changeOf(valuesRequest.result[i]);
-                });
+            if ( this.observed(area) ) {
+                const keysRequest = store.getAllKeys();
+                const valuesRequest = store.getAll();
+                valuesRequest.onsuccess = ( ) => {
+                    keysRequest.result.forEach((key, i) => {
+                        changes[key] = changeOf(valuesRequest.result[i]);
+                    });
+                    store.clear();
+                };
+            } else {
                 store.clear();
-            };
+            }
             await idbDone(transaction);
         }
         this.notify(area, changes);
@@ -486,6 +500,13 @@ const StorageService = class {
             if ( value !== undefined ) { out[key] = value; }
         }
         return out;
+    }
+
+    // Whether anyone listens for the area's changes: only then does a write
+    // read back the values it replaces, which for uBO's cache weigh
+    // megabytes (nothing of uBO's listens).
+    observed(area) {
+        return this.onChanged.hasListeners || this.areaChanged[area].hasListeners;
     }
 
     notify(area, changes) {
