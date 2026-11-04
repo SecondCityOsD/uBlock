@@ -44,7 +44,7 @@
 //   --pristine        build uBO's code as released, without our changes, to
 //                     compare (debug builds only)
 
-import { buildSync } from 'esbuild';
+import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -234,20 +234,56 @@ const rewriteForUXP = des => {
     return summary;
 };
 
-// The network filtering engine's worker: platform/uxp/engine/worker.js and
-// the modules it imports from the package's copy of uBO, rewrites included,
+// The filtering engine's worker: platform/uxp/engine/worker.js and the
+// modules it imports from the package's copy of uBO, rewrites included,
 // bundled into one plain worker script (UXP has no module workers); its
-// imports are relative to the package's root, where its entry is placed for
-// the time of the bundling. And its page side, which storage.js imports.
+// imports are relative to the package's root, where it and worker-env.js
+// are placed for the time of the bundling. And its page side, which
+// storage.js imports.
 const ENGINE_WORKER = 'js/uxp-engine-worker.js';
 const ENGINE_CLIENT = 'js/uxp-engine.js';
 
-const addEngine = des => {
+// The modules the worker's modules import that it can't have, and what
+// stands in for each in the bundle (exports of worker-env.js): those of
+// uBO's background page, and the built-in scriptlets, which
+// redirect-engine.js imports with import(), which UXP's workers can't even
+// parse.
+const WORKER_STAND_INS = new Map([
+    [ 'js/background.js', 'export { µb as default }' ],
+    [ 'js/broadcast.js', 'export { onBroadcast }' ],
+    [ 'js/logger.js', 'export { logger as default }' ],
+    [ 'js/resources/scriptlets.js', 'export { builtinScriptlets }' ],
+]);
+
+const standInsPlugin = des => ({
+    name: 'uxp-engine-stand-ins',
+    setup(bundler) {
+        bundler.onResolve({ filter: /\.js$/ }, args => {
+            if ( args.kind === 'entry-point' ) { return; }
+            // uBO's absolute paths are relative to the package's root.
+            const resolved = args.path.startsWith('/')
+                ? path.join(des, args.path)
+                : path.resolve(args.resolveDir, args.path);
+            const rel = path.relative(des, resolved).split(path.sep).join('/');
+            if ( WORKER_STAND_INS.has(rel) === false ) { return; }
+            return { path: rel, namespace: 'uxp-stand-in' };
+        });
+        bundler.onLoad({ filter: /.*/, namespace: 'uxp-stand-in' }, args => ({
+            contents: `${WORKER_STAND_INS.get(args.path)} from './worker-env.js';\n`,
+            resolveDir: des,
+            loader: 'js',
+        }));
+    },
+});
+
+const addEngine = async des => {
     fs.copyFileSync(path.join(PLATFORM, 'engine', 'client.js'), path.join(des, ENGINE_CLIENT));
     const entry = path.join(des, 'uxp-engine-worker.entry.js');
+    const env = path.join(des, 'worker-env.js');
     fs.copyFileSync(path.join(PLATFORM, 'engine', 'worker.js'), entry);
+    fs.copyFileSync(path.join(PLATFORM, 'engine', 'worker-env.js'), env);
     try {
-        buildSync({
+        await build({
             absWorkingDir: des,
             entryPoints: [ entry ],
             outfile: path.join(des, ENGINE_WORKER),
@@ -256,14 +292,22 @@ const addEngine = des => {
             charset: 'utf8',
             legalComments: 'none',
             logLevel: 'warning',
+            plugins: [ standInsPlugin(des) ],
             banner: {
                 js: '// Built by tools/make-uxp.mjs from platform/uxp/engine/worker.js and uBlock Origin\'s modules (GPLv3, see LICENSE.txt).',
             },
         });
     } finally {
         fs.rmSync(entry);
+        fs.rmSync(env);
     }
-    return fs.statSync(path.join(des, ENGINE_WORKER)).size;
+    // A worker script that UXP can't parse never runs at all: the page then
+    // does the work itself, silently slower.
+    const code = fs.readFileSync(path.join(des, ENGINE_WORKER), 'utf8');
+    if ( /\bimport\s*\(/.test(code) ) {
+        throw new Error(`${ENGINE_WORKER} has an import(), which UXP's workers can't parse: give the module a stand-in (WORKER_STAND_INS)`);
+    }
+    return Buffer.byteLength(code);
 };
 
 // tools/make-firefox-meta.py
@@ -513,7 +557,7 @@ const main = async ( ) => {
     const changed = changedFiles(BUILD);
     const compat = rewriteForUXP(BUILD);
     // uBO's code as released doesn't use the engine's worker.
-    const workerSize = options.pristine ? 0 : addEngine(BUILD);
+    const workerSize = options.pristine ? 0 : await addEngine(BUILD);
     const manifest = writeFirefoxMeta(BUILD, version);
     overlayPlatform(BUILD, options);
     writeInstallRdf(BUILD, manifest, emVersion, options);

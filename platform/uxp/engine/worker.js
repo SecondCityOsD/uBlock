@@ -1,6 +1,6 @@
 /*******************************************************************************
 
-    uBlock Origin for UXP - the network filtering engine's worker
+    uBlock Origin for UXP - the filtering engine's worker
     Copyright (C) 2026-present uBlock-UXP contributors
 
     This program is free software: you can redistribute it and/or modify
@@ -19,29 +19,49 @@
 */
 
 // UXP has no extension process: whatever uBO's background page computes
-// blocks the browser (PLAN.md, Phase 6d findings). This worker builds uBO's
-// network filtering engine off the main thread from the compiled lists, and
-// hands it back as the engine's selfie, which the page loads with
-// fromSelfie(): uBO's own restore path, the one every launch takes.
+// blocks the browser (PLAN.md, Phase 6d findings). This worker does uBO's
+// heaviest work off the main thread, with uBO's own code:
+// - it compiles filter lists, with µb.compileFilters()'s loop
+//   (static-filtering-compiler.js), and answers with the compiled list;
+// - it builds the network filtering engine from compiled lists, and
+//   answers with the engine's selfie, which the page loads with
+//   fromSelfie(): uBO's own restore path, the one every launch takes.
 //
 // tools/make-uxp.mjs bundles it, with the package's copy of uBO's modules,
 // into js/uxp-engine-worker.js: a plain worker script, as UXP has no module
-// workers. Its imports are relative to the package's root.
+// workers. Its imports are relative to the package's root, but for
+// worker-env.js, its stand-ins for the background page.
 //
-// One build per worker: the selfie's buffers are transferred to the page,
-// which leaves this copy of the engine unusable.
+// Texts go both ways in slices, one per message: UXP copies a message's
+// strings on the sending thread, ~11 ms per MB, and the compiled default
+// lists weigh ~78 MB. A worker compiles any number of lists, or builds one
+// engine: the selfie's buffers are transferred to the page, which leaves
+// this copy of the engine unusable.
 //
-// The page sends each compiled list in slices, one per message: UXP copies
-// a message's strings on the sending thread, ~11 ms per MB, and the
-// compiled default lists weigh ~78 MB.
-//
-// Requests: { what: 'append', key, text }   (a list's next slice)
-//           { what: 'buildNetworkEngine' }   (the lists appended, in order)
-// Answer:   { what: 'networkEngine', selfie, counts: { key: [ accepted, discarded ] } }
-//           { what: 'error', message }
+// Requests: { what: 'append', key, text }
+//               the next slice of a text: a raw list to compile, or a
+//               compiled list to build from
+//           { what: 'compile', key, options, hiddenSettings, redirectAliases }
+//               compile the raw list appended as `key`; options are
+//               compileFilterList()'s, the rest what uBO's engines read
+//               from the page (µb.hiddenSettings, redirectEngine.aliases)
+//           { what: 'buildNetworkEngine' }
+//               build from all the compiled lists appended, in order
+// Answers:  { what: 'compiledSlice', key, text }, then
+//           { what: 'compiled', key, messages }
+//               the compiled list in slices, then what uBO's compiler
+//               wrote to its logger
+//           { what: 'networkEngine', selfie, counts: { key: [ accepted, discarded ] } }
+//           { what: 'error', key, message }
 
+import { logger, µb } from './worker-env.js';
 import { CompiledListReader } from './js/static-filtering-io.js';
+import { compileFilterList } from './js/static-filtering-compiler.js';
+import { redirectEngine } from './js/redirect-engine.js';
 import staticNetFilteringEngine from './js/static-net-filtering.js';
+
+// As platform/uxp/engine/client.js's.
+const SLICE_LENGTH = 1 << 20;
 
 // The buffers a selfie holds: its typed arrays go to the page uncopied.
 const buffersOf = function(value, out = new Set(), depth = 0) {
@@ -56,6 +76,16 @@ const buffersOf = function(value, out = new Set(), depth = 0) {
         for ( const item of Object.values(value) ) { buffersOf(item, out, depth + 1); }
     }
     return out;
+};
+
+// µb.compileFilters(), with the page's state it depends on.
+const compile = function(text, { options, hiddenSettings, redirectAliases }) {
+    µb.hiddenSettings.allowGenericProceduralFilters =
+        hiddenSettings.allowGenericProceduralFilters;
+    redirectEngine.aliases = redirectAliases;
+    logger.entries.length = 0;
+    const compiled = compileFilterList(text, options);
+    return { compiled, messages: logger.entries.splice(0) };
 };
 
 // uBO's loadFilterLists(), the network engine's part: each list loaded in
@@ -77,26 +107,52 @@ const buildNetworkEngine = function(lists) {
     return { selfie: snfe.toSelfie(), counts };
 };
 
-// The lists' slices, by key, in the order the lists came.
+// The texts' slices, by key, in the order the texts came.
 const slices = new Map();
 
+const takeText = function(key) {
+    const parts = slices.get(key) || [];
+    slices.delete(key);
+    return parts.join('');
+};
+
+let built = false;
+
 self.onmessage = ev => {
-    const { what } = ev.data;
+    const { what, key } = ev.data;
     try {
-        if ( what === 'append' ) {
-            const { key, text } = ev.data;
-            if ( slices.has(key) === false ) { slices.set(key, []); }
-            slices.get(key).push(text);
-            return;
+        if ( built ) {
+            throw new Error('this worker built an engine: its buffers are gone');
         }
-        if ( what !== 'buildNetworkEngine' ) {
+        switch ( what ) {
+        case 'append': {
+            if ( slices.has(key) === false ) { slices.set(key, []); }
+            slices.get(key).push(ev.data.text);
+            break;
+        }
+        case 'compile': {
+            const { compiled, messages } = compile(takeText(key), ev.data);
+            for ( let i = 0; i === 0 || i < compiled.length; i += SLICE_LENGTH ) {
+                self.postMessage({ what: 'compiledSlice', key, text: compiled.slice(i, i + SLICE_LENGTH) });
+            }
+            self.postMessage({ what: 'compiled', key, messages });
+            break;
+        }
+        case 'buildNetworkEngine': {
+            const lists = Array.from(slices, ([ listKey, parts ]) => ({
+                key: listKey,
+                compiled: parts.join(''),
+            }));
+            slices.clear();
+            built = true;
+            const { selfie, counts } = buildNetworkEngine(lists);
+            self.postMessage({ what: 'networkEngine', selfie, counts }, Array.from(buffersOf(selfie)));
+            break;
+        }
+        default:
             throw new Error(`unknown request: ${what}`);
         }
-        const lists = Array.from(slices, ([ key, parts ]) => ({ key, compiled: parts.join('') }));
-        slices.clear();
-        const { selfie, counts } = buildNetworkEngine(lists);
-        self.postMessage({ what: 'networkEngine', selfie, counts }, Array.from(buffersOf(selfie)));
     } catch (ex) {
-        self.postMessage({ what: 'error', message: String(ex && ex.stack || ex) });
+        self.postMessage({ what: 'error', key, message: String(ex && ex.stack || ex) });
     }
 };

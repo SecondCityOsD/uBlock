@@ -18,8 +18,10 @@
 
 */
 
-// Lints the code written here, platform/uxp/ and tools/, with upstream uBO's
-// own rules (upstream/eslint.config.mjs). upstream/ is uBO's to lint.
+// Lints the code written here, platform/uxp/ and tools/, and uBO's code,
+// upstream/src/js/, which our changes go into (PLAN.md, "Changes to uBO's
+// code"), all with upstream uBO's own rules (upstream/eslint.config.mjs).
+// The rest of upstream/ is uBO's to lint.
 //
 // Usage: npm run lint
 
@@ -69,7 +71,16 @@ const bootstrapGlobals = {
 
 export default [
     {
-        ignores: [ 'upstream/', 'dist/', '.uxp-test/' ],
+        // upstream/ but src/js/: the directories down to it are kept, not
+        // their other contents.
+        ignores: [
+            'upstream/**/*',
+            '!upstream/src/',
+            '!upstream/src/js/',
+            '!upstream/src/js/**/*',
+            'dist/',
+            '.uxp-test/',
+        ],
     },
     {
         files: [ '**/*.js', '**/*.jsm', '**/*.mjs' ],
@@ -117,6 +128,19 @@ export default [
         files: [ 'platform/uxp/engine/worker.js' ],
         languageOptions: {
             globals: globals.worker,
+        },
+    },
+    // uBO's code: modules of its pages, with upstream's globals (and the
+    // WebExtension ones its code names, `browser` and `chrome`).
+    {
+        files: [ 'upstream/src/js/**/*.js' ],
+        languageOptions: {
+            sourceType: 'module',
+            globals: {
+                ...globals.browser,
+                ...globals.webextensions,
+                vAPI: 'readonly',
+            },
         },
     },
     // Build and test tools, run by Node.

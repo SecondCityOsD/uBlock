@@ -21,9 +21,6 @@
 
 /******************************************************************************/
 
-import * as sfp from './static-filtering-parser.js';
-
-import { CompiledListReader, CompiledListWriter } from './static-filtering-io.js';
 import { LineIterator, orphanizeString } from './text-utils.js';
 import { broadcast, filteringBehaviorChanged, onBroadcast } from './broadcast.js';
 import { i18n, i18n$ } from './i18n.js';
@@ -33,7 +30,17 @@ import {
     permanentURLFiltering,
 } from './filtering-engines.js';
 import { ubolog, ubologSet } from './console.js';
+// [uBlock-UXP] platform/uxp/engine/client.js: compiles filter lists and
+// builds the network filtering engine in a worker.
+import {
+    buildNetworkEngine as uxpBuildNetworkEngine,
+    compileFilters as uxpCompileFilters,
+} from './uxp-engine.js';
 
+// [uBlock-UXP] µb.compileFilters()'s loop is in static-filtering-compiler.js,
+// with the parser (sfp) and the CompiledListWriter it used.
+import { CompiledListReader } from './static-filtering-io.js';
+import { compileFilterList } from './static-filtering-compiler.js';
 import cosmeticFilteringEngine from './cosmetic-filtering.js';
 import { getTrustedTokens } from './trusted-tokens.js';
 import { hostnameFromURI } from './uri-utils.js';
@@ -45,9 +52,6 @@ import { redirectEngine } from './redirect-engine.js';
 import staticExtFilteringEngine from './static-ext-filtering.js';
 import { staticFilteringReverseLookup } from './reverselookup.js';
 import staticNetFilteringEngine from './static-net-filtering.js';
-// [uBlock-UXP] platform/uxp/engine/client.js: builds the network filtering
-// engine in a worker.
-import { buildNetworkEngine as uxpBuildNetworkEngine } from './uxp-engine.js';
 import µb from './background.js';
 
 /******************************************************************************/
@@ -1077,8 +1081,36 @@ onBroadcast(msg => {
 
 /******************************************************************************/
 
+// [uBlock-UXP] Lists being compiled off the main thread (compileFiltersAsync()):
+// whoever wants one's compiled form meanwhile waits for it, rather than read
+// an older one from the cache or compile it again. It goes to the cache
+// unless the list's compiled form was removed meanwhile.
+const pendingCompiles = new Map();
+
+const compileToCache = function(assetKey, rawText) {
+    const compiling = µb.compileFiltersAsync(rawText, {
+        assetKey,
+        trustedSource: µb.isTrustedList(assetKey),
+    });
+    pendingCompiles.set(assetKey, compiling);
+    const isCurrent = ( ) => pendingCompiles.get(assetKey) === compiling;
+    compiling.then(compiled => {
+        if ( isCurrent() === false ) { return; }
+        pendingCompiles.delete(assetKey);
+        io.toCache(`compiled/${assetKey}`, compiled);
+    }, ( ) => {
+        if ( isCurrent() ) { pendingCompiles.delete(assetKey); }
+    });
+    return compiling;
+};
+
 µb.getCompiledFilterList = async function(assetKey) {
     const compiledPath = `compiled/${assetKey}`;
+
+    // [uBlock-UXP] Being compiled (pendingCompiles).
+    if ( pendingCompiles.has(assetKey) ) {
+        return { assetKey, content: await pendingCompiles.get(assetKey) };
+    }
 
     // https://github.com/uBlockOrigin/uBlock-issues/issues/1365
     //   Verify that the list version matches that of the current compiled
@@ -1116,11 +1148,8 @@ onBroadcast(msg => {
         return { assetKey, content: '' };
     }
 
-    const compiledContent = this.compileFilters(rawDetails.content, {
-        assetKey,
-        trustedSource: this.isTrustedList(assetKey),
-    });
-    io.toCache(compiledPath, compiledContent);
+    // [uBlock-UXP] Off the main thread.
+    const compiledContent = await compileToCache(assetKey, rawDetails.content);
 
     return { assetKey, content: compiledContent };
 };
@@ -1149,6 +1178,8 @@ onBroadcast(msg => {
 /******************************************************************************/
 
 µb.removeCompiledFilterList = function(assetKey) {
+    // [uBlock-UXP] A compile under way no longer goes to the cache.
+    pendingCompiles.delete(assetKey);
     io.remove(`compiled/${assetKey}`);
 };
 
@@ -1159,76 +1190,45 @@ onBroadcast(msg => {
 
 /******************************************************************************/
 
+// [uBlock-UXP] The compile loop is in static-filtering-compiler.js, for the
+// engine's worker to run it too; what it reads from the page comes in the
+// options.
+const compileOptions = details => ({
+    assetKey: details.assetKey,
+    trustedSource: details.trustedSource === true,
+    env: vAPI.webextFlavor.env,
+    canFilterResponseBody: µb.canFilterResponseData,
+    trustedTokens: getTrustedTokens(),
+    compiledMagic: µb.systemSettings.compiledMagic,
+});
+
 µb.compileFilters = function(rawText, details = {}) {
-    const writer = new CompiledListWriter();
+    return compileFilterList(rawText, compileOptions(details));
+};
 
-    // Populate the writer with information potentially useful to the
-    // client compilers.
-    if ( details.assetKey ) {
-        writer.properties.set('name', details.assetKey);
+// [uBlock-UXP] µb.compileFilters() in the engine's worker, off the main
+// thread, with the page's state uBO's engines read as they compile; on the
+// page if the worker fails. What the compiler wrote to its logger comes
+// back for the page's logger.
+µb.compileFiltersAsync = async function(rawText, details = {}) {
+    const assetName = details.assetKey || '?';
+    try {
+        const { compiled, messages } = await uxpCompileFilters(rawText, {
+            options: compileOptions(details),
+            hiddenSettings: {
+                allowGenericProceduralFilters: this.hiddenSettings.allowGenericProceduralFilters,
+            },
+            redirectAliases: redirectEngine.aliases,
+        });
+        for ( const message of messages ) {
+            logger.writeOne(message);
+        }
+        ubolog(`compileFiltersAsync() ${assetName} compiled in a worker`);
+        return compiled;
+    } catch (reason) {
+        ubolog(`compileFiltersAsync() ${assetName} compiled on the page: ${reason}`);
+        return this.compileFilters(rawText, details);
     }
-    const assetName = details.assetKey ? details.assetKey : '?';
-    const parser = new sfp.AstFilterParser({
-        trustedSource: details.trustedSource === true,
-        maxTokenLength: staticNetFilteringEngine.MAX_TOKEN_LENGTH,
-        nativeCssHas: vAPI.webextFlavor.env.includes('native_css_has'),
-        canFilterResponseBody: µb.canFilterResponseData,
-        trustedTokens: getTrustedTokens(),
-    });
-    const compiler = staticNetFilteringEngine.createCompiler(parser);
-    const lineIter = new LineIterator(
-        sfp.utils.preparser.prune(rawText, vAPI.webextFlavor.env)
-    );
-
-    compiler.start(writer);
-
-    while ( lineIter.eot() === false ) {
-        let line = lineIter.next();
-
-        while ( line.endsWith(' \\') ) {
-            if ( lineIter.peek(4) !== '    ' ) { break; }
-            line = line.slice(0, -2).trim() + lineIter.next().trim();
-        }
-
-        parser.parse(line);
-
-        if ( parser.isFilter() === false ) { continue; }
-        if ( parser.hasError() ) {
-            logger.writeOne({
-                realm: 'message',
-                type: 'error',
-                text: `Invalid filter (${assetName}): ${parser.raw}`
-            });
-            continue;
-        }
-
-        if ( parser.isExtendedFilter() ) {
-            staticExtFilteringEngine.compile(parser, writer);
-            continue;
-        }
-
-        if ( parser.isNetworkFilter() === false ) { continue; }
-
-        if ( compiler.compile(parser, writer) ) { continue; }
-        if ( compiler.error !== undefined ) {
-            logger.writeOne({
-                realm: 'message',
-                type: 'error',
-                text: compiler.error
-            });
-        }
-    }
-
-    compiler.finish(writer);
-    parser.finish();
-
-    // https://github.com/uBlockOrigin/uBlock-issues/issues/1365
-    //   Embed version into compiled list itself: it is encoded in as the
-    //   first digits followed by a whitespace.
-    const compiledContent
-        = `${this.systemSettings.compiledMagic}\n` + writer.toString();
-
-    return compiledContent;
 };
 
 /******************************************************************************/
@@ -1681,12 +1681,9 @@ onBroadcast(msg => {
                         details.content
                     );
                     if ( this.badLists.has(details.assetKey) === false ) {
-                        io.toCache(`compiled/${details.assetKey}`,
-                            this.compileFilters(details.content, {
-                                assetKey: details.assetKey,
-                                trustedSource: this.isTrustedList(details.assetKey),
-                            })
-                        );
+                        // [uBlock-UXP] Off the main thread: the reload the
+                        // update ends with waits for it.
+                        compileToCache(details.assetKey, details.content);
                     }
                 }
             } else {

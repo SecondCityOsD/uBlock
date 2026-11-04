@@ -43,6 +43,8 @@
 //                        (keepConsoleLog: the next instance appends)
 //             'stalls'   ... measure the main thread's stalls on a first
 //                        install, a reload of all lists, a selfie save
+//             'compile'  ... check that the engine's worker compiles each
+//                        list as uBO's own compiler does, byte for byte
 //             and write <scenario>.json
 //   autoQuit  true    quit the application once the scenario is done
 // Without autoQuit, a manually installed debug build never quits the browser.
@@ -2631,11 +2633,15 @@ const runStalls = async function() {
     report.builtBy = consoleLines
         .filter(l => /Network filters built/.test(l.text))
         .map(l => l.text.replace(/^\[uBO\] loadFilterLists\(\) /, ''));
+    // Every list compiled: on the first install, and urlhaus's update.
+    report.compiledBy = compiledWhere(0).map(({ key, where }) => `${key} ${where}`);
+    const compiledOnPage = report.compiledBy.filter(t => t.endsWith(' in a worker') === false);
     const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
     const { firstInstall = {}, reload = {}, update = {}, selfie = {} } = report;
     const sameCounts = after => after !== undefined && JSON.stringify(after) === JSON.stringify(reload.countsBefore);
     const checks = {
         builtInWorker: pass(report.builtBy.length === 3 && report.builtBy.every(t => t.includes('in a worker')), report.builtBy),
+        compiledInWorker: pass(report.compiledBy.length !== 0 && compiledOnPage.length === 0, compiledOnPage),
         reloadCountsUnchanged: pass(sameCounts(reload.countsAfter), reload.countsAfter),
         updateCountsUnchanged: pass(sameCounts(update.countsAfter), update.countsAfter),
         reloadNoFreeze: pass(reload.longestStallMs < 300, reload.longest),
@@ -2655,6 +2661,157 @@ const runStalls = async function() {
         update: brief(update),
         selfie: brief(selfie),
         builtBy: report.builtBy,
+    };
+    if ( failure !== null ) {
+        report.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
+// Compile: uBO's compiling off the main thread (µb.compileFiltersAsync(),
+// the engine's worker) makes of each enabled list exactly what its own
+// compiler on the background page makes of it (µb.compileFilters()), byte
+// for byte, and what each costs the browser's main thread. The raw lists
+// are the package's.
+
+// A file of the add-on's package, as text.
+const readPackageText = function(rel) {
+    const channel = NetUtil.newChannel({
+        uri: addonData.resourceURI.spec + rel,
+        loadUsingSystemPrincipal: true,
+    });
+    const stream = typeof channel.open2 === 'function' ? channel.open2() : channel.open();
+    try {
+        return NetUtil.readInputStreamToString(stream, stream.available(), { charset: 'UTF-8' });
+    } finally {
+        stream.close();
+    }
+};
+
+// Where two texts first differ: the offset, the line, each one's line.
+const firstDifference = function(a, b) {
+    let i = 0;
+    while ( i < a.length && a.charCodeAt(i) === b.charCodeAt(i) ) { i += 1; }
+    const start = a.lastIndexOf('\n', i - 1) + 1;
+    let line = 1;
+    for ( let j = a.indexOf('\n'); j !== -1 && j < start; j = a.indexOf('\n', j + 1) ) {
+        line += 1;
+    }
+    const lineAt = s => {
+        const end = s.indexOf('\n', start);
+        return s.slice(start, end === -1 ? s.length : end).slice(0, 200);
+    };
+    return { offset: i, line, worker: lineAt(a), page: lineAt(b) };
+};
+
+const megabytes = s => Math.round(s.length / 10485.76) / 100;
+
+// What uBO logged of where it compiled lists (compileFiltersAsync()), from
+// the console's line `first` on: [ { key, where } ], where is 'in a worker'
+// or 'on the page: <reason>'.
+const compiledWhere = function(first) {
+    const out = [];
+    for ( const line of consoleLines.slice(first) ) {
+        const match = /compileFiltersAsync\(\) (\S+) compiled (.+)$/.exec(line.text);
+        if ( match !== null ) { out.push({ key: match[1], where: match[2] }); }
+    }
+    return out;
+};
+
+const runCompile = async function() {
+    const report = { lists: {} };
+    let failure = null;
+    try {
+        const { bgWindow } = await whenUBOReady();
+        const page = Cu.waiveXrays(bgWindow);
+        const µb = page.µBlock;
+        // uBO's own selfie save, done now rather than in the middle.
+        await callUBO(bgWindow, 'selfieManager.create');
+
+        // The enabled lists the package holds.
+        const lists = [];
+        for ( const [ key, entry ] of Object.entries(plain(µb.availableFilterLists)) ) {
+            if ( entry.off === true ) { continue; }
+            const locals = [].concat(entry.contentURL || []).filter(url => /^[a-z]+:/i.test(url) === false);
+            if ( locals.length === 0 ) { continue; }
+            let raw;
+            for ( const local of locals ) {
+                try {
+                    raw = readPackageText(local);
+                    break;
+                } catch {
+                }
+            }
+            if ( raw === undefined ) {
+                report.lists[key] = { notInPackage: locals.join(', ') };
+                continue;
+            }
+            lists.push({ key, raw });
+        }
+        await sleep(3000);
+
+        // All lists compiled off the main thread; then by uBO's compiler on
+        // the page, each result compared with the other.
+        const details = key => Cu.cloneInto({
+            assetKey: key,
+            trustedSource: µb.isTrustedList(key),
+        }, page);
+        startStallMonitor();
+        const offThread = new Map();
+        const firstLine = consoleLines.length;
+        let from = Date.now();
+        for ( const { key, raw } of lists ) {
+            report.lists[key] = { rawMB: megabytes(raw) };
+            const t0 = Date.now();
+            offThread.set(key, await Promise.resolve(µb.compileFiltersAsync(raw, details(key))));
+            report.lists[key].workerMs = Date.now() - t0;
+        }
+        report.compiledWhere = Object.fromEntries(
+            compiledWhere(firstLine).map(({ key, where }) => [ key, where ])
+        );
+        report.worker = { durationMs: Date.now() - from, ...stallsBetween(from, Date.now()) };
+
+        from = Date.now();
+        for ( const { key, raw } of lists ) {
+            const result = report.lists[key];
+            const t0 = Date.now();
+            const compiled = µb.compileFilters(raw, details(key));
+            result.pageMs = Date.now() - t0;
+            result.compiledMB = megabytes(compiled);
+            const theirs = offThread.get(key);
+            offThread.delete(key);
+            result.identical = theirs === compiled;
+            if ( result.identical === false ) {
+                result.firstDifference = firstDifference(theirs, compiled);
+            }
+            await sleep(0);
+        }
+        report.page = { durationMs: Date.now() - from, ...stallsBetween(from, Date.now()) };
+    } catch (ex) {
+        failure = String(ex);
+    }
+    clearTimeout(stalls.timer);
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const checked = Object.entries(report.lists).filter(([ , r ]) => r.notInPackage === undefined);
+    const differing = checked.filter(([ , r ]) => r.identical !== true).map(([ key ]) => key);
+    const { compiledWhere: where = {}, worker = {} } = report;
+    const notInWorker = checked.filter(([ key ]) => where[key] !== 'in a worker')
+        .map(([ key ]) => `${key}: ${where[key] || 'not logged'}`);
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks: {
+            compiledInWorker: pass(checked.length !== 0 && notInWorker.length === 0, notInWorker),
+            identicalToPage: pass(checked.length !== 0 && differing.length === 0, differing),
+            workerNoFreeze: pass(worker.longestStallMs < 300, worker.longest),
+        },
+        worker: report.worker,
+        page: report.page,
+        lists: Object.fromEntries(Object.entries(report.lists).map(([ key, r ]) => [ key, r.notInPackage
+            ? `not in the package: ${r.notInPackage}`
+            : `raw ${r.rawMB} MB -> ${r.compiledMB} MB, worker ${r.workerMs} ms, page ${r.pageMs} ms`,
+        ])),
     };
     if ( failure !== null ) {
         report.error = failure;
@@ -2693,6 +2850,7 @@ const scenarios = {
     update: runUpdate,
     'stop-busy': runStopBusy,
     stalls: runStalls,
+    compile: runCompile,
 };
 
 // Filters and user settings given to uBO through managed storage.
@@ -2707,6 +2865,7 @@ const SCENARIO_USER_SETTINGS = {
     filtering: FILTERING_USER_SETTINGS,
     // Its own update phase only: uBO's updater would overlap the others.
     stalls: [ [ 'autoUpdate', 'false' ] ],
+    compile: [ [ 'autoUpdate', 'false' ] ],
 };
 
 // Test pages served under a name of their own (network.dns.localDomains).
