@@ -644,6 +644,17 @@ onBroadcast(msg => {
     //   duplicates at this point may lead to more issues.
     await this.saveUserFilters(details.content.trim() + '\n' + filters);
 
+    // [uBlock-UXP] A load under way swaps in engines built from the user
+    // filters it read, maybe before these were saved: added to the engines
+    // in use, they would go with them. The lists load again once it's done.
+    const loading = this.filterListsLoading();
+    if ( loading !== undefined ) {
+        const reload = ( ) => this.loadFilterLists();
+        loading.then(reload, reload);
+        broadcast({ what: 'userFiltersUpdated' });
+        return;
+    }
+
     const compiledFilters = this.compileFilters(filters, {
         assetKey: this.userFiltersPath,
         trustedSource: true,
@@ -904,19 +915,29 @@ onBroadcast(msg => {
     const loadedListKeys = [];
     let loadingPromise;
     let t0 = 0;
+    // [uBlock-UXP] Whether this load holds network requests (onFilterListsReady()).
+    let suspended = false;
 
     const elapsed = ( ) => `${Date.now() - t0} ms`;
 
     const onDone = async ( ) => {
         ubolog(`loadFilterLists() All filters in memory at ${elapsed()}`);
 
-        // [uBlock-UXP] See buildNetworkEngine().
-        await buildNetworkEngine();
+        // [uBlock-UXP] The network engine is built in a worker while the
+        // engines from before filter; then the new engines take their place
+        // and are frozen, in one synchronous step (swapEngines()).
+        const lists = networkLists.splice(0);
+        const built = await buildInWorker(lists);
+        swapEngines(lists, built);
 
         staticNetFilteringEngine.freeze();
         staticExtFilteringEngine.freeze();
         redirectEngine.freeze();
-        vAPI.net.unsuspend();
+        // [uBlock-UXP] Only if this load held network requests.
+        if ( suspended ) {
+            suspended = false;
+            vAPI.net.unsuspend();
+        }
         filteringBehaviorChanged();
 
         ubolog(`loadFilterLists() All filters ready at ${elapsed()}`);
@@ -942,58 +963,70 @@ onBroadcast(msg => {
         loadingPromise = undefined;
     };
 
-    // [uBlock-UXP] UXP has no extension process: building the network
-    // filtering engine here would block the browser for seconds. Each
-    // list's cosmetic part is loaded as it comes, its network part kept,
-    // with what the cosmetic part counted, for onDone().
+    // [uBlock-UXP] UXP has no extension process: building the engines here
+    // would block the browser for seconds. Each list's compiled form is
+    // kept as it comes, for onDone(): its network part to build that
+    // engine in a worker, its cosmetic part to load as the engines swap.
     const networkLists = [];
 
     const applyCompiledFilters = (assetKey, compiled) => {
         ubolog(`loadFilterLists() Loading filters from ${assetKey} at ${elapsed()}`);
-        const sxfe = staticExtFilteringEngine;
-        const acceptedCount = sxfe.acceptedCount;
-        const discardedCount = sxfe.discardedCount;
-        µb.applyCompiledFilters(compiled, assetKey === µb.userFiltersPath, false);
         networkLists.push({
             key: assetKey,
             compiled,
-            accepted: sxfe.acceptedCount - acceptedCount,
-            discarded: sxfe.discardedCount - discardedCount,
+            firstparty: assetKey === µb.userFiltersPath,
         });
         loadedListKeys.push(assetKey);
     };
 
-    // [uBlock-UXP] The network engine, from the lists' network parts:
-    // built in a worker and loaded from its selfie, or, if that fails,
-    // built here as upstream does. A list's counts are what its
-    // cosmetic and its network filters counted.
-    const buildNetworkEngine = async ( ) => {
-        const lists = networkLists.splice(0);
-        const snfe = staticNetFilteringEngine;
-        let counts;
+    // [uBlock-UXP] The network engine, from the lists' network parts, built
+    // in a worker: { built: { selfie, counts } }, or { reason } it failed.
+    const buildInWorker = async lists => {
         try {
-            const built = await uxpBuildNetworkEngine(lists);
-            if ( snfe.fromSelfie(built.selfie) !== true ) {
-                throw new Error('fromSelfie() failed');
-            }
-            counts = built.counts;
-            ubolog(`loadFilterLists() Network filters built in a worker at ${elapsed()}`);
+            return { built: await uxpBuildNetworkEngine(lists) };
         } catch (reason) {
-            ubolog(`loadFilterLists() Network filters built on the page: ${reason}`);
+            return { reason };
+        }
+    };
+
+    // [uBlock-UXP] The new engines take the place of those in use, in one
+    // synchronous step, so that no request and no content script ever sees
+    // them half-loaded: the cosmetic engines from each list's compiled
+    // form, in the order the lists came; the network engine from the
+    // worker's selfie, or built here as upstream does if that failed. A
+    // list's counts are what its cosmetic and its network filters counted.
+    const swapEngines = (lists, { built, reason }) => {
+        const sxfe = staticExtFilteringEngine;
+        const snfe = staticNetFilteringEngine;
+        sxfe.reset();
+        const cosmetic = {};
+        for ( const { key, compiled, firstparty } of lists ) {
+            const accepted = sxfe.acceptedCount;
+            const discarded = sxfe.discardedCount;
+            µb.applyCompiledFilters(compiled, firstparty, false);
+            cosmetic[key] = [ sxfe.acceptedCount - accepted, sxfe.discardedCount - discarded ];
+        }
+        let network;
+        if ( built !== undefined && snfe.fromSelfie(built.selfie) === true ) {
+            network = built.counts;
+            ubolog(`loadFilterLists() Network filters built in a worker at ${elapsed()}`);
+        } else {
+            ubolog(`loadFilterLists() Network filters built on the page: ${reason || 'fromSelfie() failed'}`);
             snfe.reset();
-            counts = {};
+            network = {};
             for ( const { key, compiled } of lists ) {
                 const accepted = snfe.acceptedCount;
                 const discarded = snfe.discardedCount;
                 if ( compiled !== '' ) {
                     snfe.fromCompiled(new CompiledListReader(compiled));
                 }
-                counts[key] = [ snfe.acceptedCount - accepted, snfe.discardedCount - discarded ];
+                network[key] = [ snfe.acceptedCount - accepted, snfe.discardedCount - discarded ];
             }
         }
-        for ( const { key, accepted, discarded } of lists ) {
+        for ( const { key } of lists ) {
             if ( Object.hasOwn(µb.availableFilterLists, key) === false ) { continue; }
-            const [ netAccepted, netDiscarded ] = counts[key] || [ 0, 0 ];
+            const [ accepted, discarded ] = cosmetic[key];
+            const [ netAccepted, netDiscarded ] = network[key] || [ 0, 0 ];
             const entry = µb.availableFilterLists[key];
             entry.entryCount = accepted + netAccepted;
             entry.entryUsedCount = entry.entryCount - (discarded + netDiscarded);
@@ -1009,17 +1042,21 @@ onBroadcast(msg => {
 
         µb.availableFilterLists = lists;
 
-        if ( vAPI.Net.canSuspend() ) {
+        // [uBlock-UXP] Until uBO filters (a first install, a launch without
+        // its selfie), it holds network requests while it loads, as
+        // upstream. Once it does, a reload doesn't: the engines from before
+        // filter until the new ones take their place (swapEngines()), which
+        // on UXP comes seconds later, as they are built in a worker.
+        if ( µb.readyToFilter !== true && vAPI.Net.canSuspend() ) {
             vAPI.net.suspend();
+            suspended = true;
         }
-        staticExtFilteringEngine.reset();
-        staticNetFilteringEngine.reset();
-        // [uBlock-UXP]
         networkLists.length = 0;
         µb.selfieManager.destroy();
         staticFilteringReverseLookup.resetLists();
 
-        ubolog(`loadFilterLists() All filters removed at ${elapsed()}`);
+        // [uBlock-UXP] Nothing is removed until the engines swap.
+        ubolog(`loadFilterLists() Lists to load at ${elapsed()}`);
 
         // We need to build a complete list of assets to pull first: this is
         // because it *may* happens that some load operations are synchronous:
@@ -1045,13 +1082,11 @@ onBroadcast(msg => {
                     });
             }
             if ( µb.inMemoryFiltersCompiled !== '' ) {
-                // [uBlock-UXP] Its network part goes with the lists'.
-                µb.applyCompiledFilters(µb.inMemoryFiltersCompiled, true, false);
+                // [uBlock-UXP] With the lists, loaded as the engines swap.
                 networkLists.push({
                     key: 'in-memory',
                     compiled: µb.inMemoryFiltersCompiled,
-                    accepted: 0,
-                    discarded: 0,
+                    firstparty: true,
                 });
             }
         }
@@ -1077,6 +1112,9 @@ onBroadcast(msg => {
         });
         return loadingPromise;
     };
+
+    // [uBlock-UXP] The load under way, if any (appendUserFilters()).
+    µb.filterListsLoading = ( ) => loadingPromise;
 }
 
 /******************************************************************************/

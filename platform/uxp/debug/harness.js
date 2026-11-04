@@ -2350,6 +2350,8 @@ const STOP_FILTERS = [
     `||${STOP_HOST}^*/uxp-blocked/`,
     `${STOP_HOST}##^#uxp-stop-removed`,
 ];
+// Added by the stalls scenario while uBO reloads.
+const ADDED_FILTER = `||${STOP_HOST}^*/uxp-added/`;
 const RUNTIME_SOURCE = /^chrome:\/\/ublock0\/content\/uxp\/|\/bootstrap\.js$/;
 const UBO_SOURCE = /^moz-extension:\/\//;
 
@@ -2382,11 +2384,20 @@ xhr.send();`)}</script>
 <img id="okImage" src="/ok/probe.svg"><img id="adImage" src="/uxp-blocked/probe.svg">
 <script>${recorderScript('')}</script></body></html>`,
         };
+    // Its image is blocked by a filter added while uBO reloads (stalls).
+    case '/added.html':
+        return {
+            type: 'text/html; charset=utf-8',
+            body: `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<img id="okImage" src="/ok/probe.svg"><img id="adImage" src="/uxp-added/probe.svg">
+<script>${recorderScript('')}</script></body></html>`,
+        };
     case '/ok/image.svg':
     case '/ok/probe.svg':
         return svg('green');
     case '/uxp-blocked/ad.svg':
     case '/uxp-blocked/probe.svg':
+    case '/uxp-added/probe.svg':
         return svg('red');
     case '/slow/image.svg':
         return { ...svg('blue'), delayMs: 3000 };
@@ -2644,32 +2655,82 @@ const listCounts = function(µb) {
     return out;
 };
 
+// A test page: how long it takes, and whether its image at `blockedPath`
+// reached the server. Opened while uBO reloads its lists: once uBO filters,
+// a reload no longer holds network requests, and the engines from before
+// still block (storage.js, onFilterListsReady()).
+const testPage = async function(win, server, path, blockedPath) {
+    const adRequests = ( ) => server.requests.filter(r => r.endsWith(blockedPath)).length;
+    const before = adRequests();
+    const t0 = Date.now();
+    const tab = win.gBrowser.addTab(`http://${STOP_HOST}:${server.port}${path}?t=${t0}`);
+    const page = await finishedPage(tab, 30000);
+    const endedAt = Date.now();
+    win.gBrowser.removeTab(tab);
+    return {
+        finished: page.finished,
+        loadMs: endedAt - t0,
+        endedAt,
+        okImage: page.results && page.results.okImage === true,
+        adBlocked: adRequests() === before,
+    };
+};
+
+// Whether the page loaded fast, before the reload it was opened during
+// ended, and with what it should block blocked.
+const passedWhileReloading = (page, reloadEndedAt) =>
+    page !== undefined && page.finished && page.loadMs < 3000 &&
+        page.endedAt < reloadEndedAt && page.okImage && page.adBlocked;
+
 const runStalls = async function() {
     const report = {};
     let failure = null;
+    const server = new TestServer(stopRoutes);
+    server.start();
     try {
         const { bgWindow, µb } = await whenUBOReady();
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
         report.firstInstall = { readyAfterMs: Date.now() - stalls.started };
         await sleep(3000);
         Object.assign(report.firstInstall, stallsBetween(stalls.started, Date.now()));
         const countsBefore = listCounts(µb);
 
         // All lists reloaded, from their compiled form, as after a list
-        // update. uBO holds network requests meanwhile.
+        // update; a page opened a second in. Then a filter added, which the
+        // engines the reload swaps in may not have read: uBO loads the lists
+        // again after it (storage.js, appendUserFilters()).
         let from = Date.now();
-        report.reload = await callUBO(bgWindow, 'loadFilterLists');
+        let reloading = callUBO(bgWindow, 'loadFilterLists');
+        await sleep(1000);
+        report.pageDuringReload = await testPage(win, server, '/probe.html', '/uxp-blocked/probe.svg');
+        await callUBO(bgWindow, 'createUserFilters', { filters: ADDED_FILTER });
+        report.reload = await reloading;
         report.reload.durationMs = Date.now() - from;
-        await sleep(3000);
-        Object.assign(report.reload, stallsBetween(from, Date.now()));
+        report.reload.endedAt = Date.now();
         report.reload.countsBefore = countsBefore;
         report.reload.countsAfter = listCounts(µb);
+        await sleep(3000);
+        Object.assign(report.reload, stallsBetween(from, Date.now()));
+        // The load the added filter brought about, once done: none at all
+        // would leave it out of the engines swapped in.
+        await waitFor(( ) => Cu.waiveXrays(bgWindow).µBlock.filterListsLoading() === undefined,
+            60000, 'the load after the added filter');
+        report.pageWithAddedFilter = await testPage(win, server, '/added.html', '/uxp-added/probe.svg');
+        // The user filters as the admin's: at a launch, uBO overwrites them
+        // with those, and its selfie with them, if they differ.
+        await callUBO(bgWindow, 'saveUserFilters', STOP_FILTERS.join('\n'));
 
         // An update of urlhaus, the biggest list: compiled again, then all
-        // lists reloaded, as uBO's updater does.
+        // lists reloaded, as uBO's updater does; a page opened a second in.
         from = Date.now();
         await callUBO(bgWindow, 'removeCompiledFilterList', 'urlhaus-1');
-        report.update = await callUBO(bgWindow, 'loadFilterLists');
+        reloading = callUBO(bgWindow, 'loadFilterLists');
+        await sleep(1000);
+        report.pageDuringUpdate = await testPage(win, server, '/probe.html', '/uxp-blocked/probe.svg');
+        report.update = await reloading;
         report.update.durationMs = Date.now() - from;
+        report.update.endedAt = Date.now();
+        report.update.countsBefore = countsBefore;
         await sleep(3000);
         Object.assign(report.update, stallsBetween(from, Date.now()));
         report.update.countsAfter = listCounts(µb);
@@ -2695,6 +2756,7 @@ const runStalls = async function() {
     } catch (ex) {
         failure = String(ex);
     }
+    server.stop();
     clearTimeout(stalls.timer);
     report.builtBy = consoleLines
         .filter(l => /Network filters built/.test(l.text))
@@ -2710,13 +2772,19 @@ const runStalls = async function() {
     const storedOnPage = report.storedBy.filter(t => t.includes('not written'));
     const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
     const { firstInstall = {}, reload = {}, update = {}, selfie = {} } = report;
-    const sameCounts = after => after !== undefined && JSON.stringify(after) === JSON.stringify(reload.countsBefore);
+    const sameCounts = (after, before) => after !== undefined && JSON.stringify(after) === JSON.stringify(before);
+    const added = report.pageWithAddedFilter;
     const checks = {
-        builtInWorker: pass(report.builtBy.length === 3 && report.builtBy.every(t => t.includes('in a worker')), report.builtBy),
+        // The first install's, the reload's, the one after the added
+        // filter, the update's.
+        builtInWorker: pass(report.builtBy.length === 4 && report.builtBy.every(t => t.includes('in a worker')), report.builtBy),
         compiledInWorker: pass(report.compiledBy.length !== 0 && compiledOnPage.length === 0, compiledOnPage),
-        reloadCountsUnchanged: pass(sameCounts(reload.countsAfter), reload.countsAfter),
-        updateCountsUnchanged: pass(sameCounts(update.countsAfter), update.countsAfter),
+        reloadCountsUnchanged: pass(sameCounts(reload.countsAfter, reload.countsBefore), reload.countsAfter),
+        updateCountsUnchanged: pass(sameCounts(update.countsAfter, update.countsBefore), update.countsAfter),
         reloadNoFreeze: pass(reload.longestStallMs < 300, reload.longest),
+        pageDuringReload: pass(passedWhileReloading(report.pageDuringReload, reload.endedAt), report.pageDuringReload),
+        pageDuringUpdate: pass(passedWhileReloading(report.pageDuringUpdate, update.endedAt), report.pageDuringUpdate),
+        filterAddedDuringReload: pass(added !== undefined && added.finished && added.okImage && added.adBlocked, added),
         selfieNoFreeze: pass(selfie.longestStallMs < 300, selfie.longest),
         storedInWorker: pass(report.storedBy.length !== 0 && storedOnPage.length === 0, storedOnPage),
         derivedOnlyInIndexedDB: pass(
@@ -2738,6 +2806,10 @@ const runStalls = async function() {
         reload: brief(reload),
         update: brief(update),
         selfie: brief(selfie),
+        pageLoadMs: report.pageDuringReload && {
+            duringReload: report.pageDuringReload.loadMs,
+            duringUpdate: report.pageDuringUpdate && report.pageDuringUpdate.loadMs,
+        },
         builtBy: report.builtBy,
         storage: report.storage,
     };
@@ -2939,6 +3011,8 @@ const SCENARIO_FILTERS = {
     ui: UI_FILTERS,
     filtering: FILTERING_FILTERS,
     'stop-busy': STOP_FILTERS,
+    // Its pages opened while uBO reloads (testPage()).
+    stalls: STOP_FILTERS,
 };
 const SCENARIO_USER_SETTINGS = {
     filtering: FILTERING_USER_SETTINGS,
@@ -2952,6 +3026,7 @@ const SCENARIO_HOSTS = {
     cosmetic: COSMETIC_HOST,
     filtering: FILTERING_HOST,
     'stop-busy': STOP_HOST,
+    stalls: STOP_HOST,
 };
 
 const runScenario = async function(name) {
