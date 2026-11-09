@@ -2989,7 +2989,59 @@ const whenBrowserReady = async function() {
     await sleep(1000);
 };
 
+/******************************************************************************/
+
+// Screen captures of this browser's windows, popups included (an arrow
+// panel is a window of its own, which drawWindow() does not see): the
+// launcher takes them (tools/uxp-capture.ps1). A process started from here
+// would take the focus, and the browser would close its popups.
+// Resolves with the PNG's path, or with why there is none.
+const captureScreen = async function(name) {
+    const done = outDir.clone();
+    done.append(`${name}.captured`);
+    if ( done.exists() ) { done.remove(false); }
+    writeText(`${name}.capture-request`, String(Services.appinfo.processID));
+    try {
+        await waitFor(( ) => done.exists(), 30000, 'the capture');
+    } catch {
+        return 'no capture: the launcher did not answer';
+    }
+    const result = readBytes(done.path);
+    const png = outDir.clone();
+    png.append(name);
+    if ( result === 'ok' ) { return png.path; }
+    return result.startsWith('ok, ')
+        ? `${png.path} (${result.slice(4)}: another window was over it)`
+        : `no capture: ${result}`;
+};
+
+// A script of the tester's own (the launcher's --script=<file>), run with
+// the harness's helpers: explorations which need no scenario of their own.
+// It may return an object, its `summary` printed by the launcher.
+const runScript = async function() {
+    const text = decodeURIComponent(escape(readBytes(getPref('script', ''))));
+    const body = new Function('h', `return (async ( ) => {\n${text}\n})();`);
+    const report = {};
+    const h = {
+        Cc, Ci, Cu, Services, report, sleep, waitFor, plain, openTab,
+        whenUBOReady, callBackground, callUBO, saveScreenshot, captureScreen,
+        log, writeText, errorsSince, TestServer, getPref, readAnyPref,
+        ownErrors: ( ) => ownErrors(consoleLines),
+        consoleLines: ( ) => consoleLines.slice(),
+        extension: ( ) => extension,
+        outDir: ( ) => outDir.path,
+    };
+    try {
+        Object.assign(report, await body(h) || {});
+    } catch (ex) {
+        report.scriptError = `${ex}\n${ex && ex.stack}`;
+    }
+    report.ownErrors = ownErrors(consoleLines);
+    return report;
+};
+
 const scenarios = {
+    script: runScript,
     probe: runProbes,
     boot: runBoot,
     network: runNetwork,

@@ -24,7 +24,11 @@
 //
 // Usage: node tools/uxp-test.mjs [--browser=palemoon|basilisk|all]
 //            [--scenario=probe] [--xpi=<path>] [--timeout=<seconds>]
-//            [--keep-profile]
+//            [--keep-profile] [--script=<file>] [--pref=<name>=<value>]...
+//
+// --script runs a script of one's own in the browser, with the harness's
+// helpers (see runScript() there). --pref sets a pref before the browser
+// starts: true, false and integers as such, anything else as a string.
 //
 // Profiles live in .uxp-test/<browser>/profile and are recreated on every
 // run unless --keep-profile is given. Browsers start with -no-remote, so
@@ -98,6 +102,8 @@ const parseArgs = function() {
         xpi: '',
         timeout: 300,
         keepProfile: false,
+        script: '',
+        prefs: {},
     };
     for ( const arg of process.argv.slice(2) ) {
         const match = /^--([a-z-]+)(?:=(.*))?$/.exec(arg);
@@ -109,6 +115,19 @@ const parseArgs = function() {
         case 'xpi': options.xpi = path.resolve(value); break;
         case 'timeout': options.timeout = parseInt(value, 10); break;
         case 'keep-profile': options.keepProfile = true; break;
+        case 'script':
+            options.script = path.resolve(value);
+            options.scenario = 'script';
+            break;
+        case 'pref': {
+            const at = value.indexOf('=');
+            if ( at <= 0 ) { throw new Error(`--pref needs <name>=<value>: ${value}`); }
+            const raw = value.slice(at + 1);
+            options.prefs[value.slice(0, at)] = raw === 'true' || raw === 'false'
+                ? raw === 'true'
+                : /^-?\d+$/.test(raw) ? parseInt(raw, 10) : raw;
+            break;
+        }
         default: throw new Error(`unknown argument: ${arg}`);
         }
     }
@@ -165,6 +184,8 @@ const prepareProfile = function(key, xpi, options) {
         ...options.scenarioPrefs,
         'extensions.ublock0.uxpTest.scenario': options.scenario,
         'extensions.ublock0.uxpTest.autoQuit': true,
+        ...(options.script !== '' ? { 'extensions.ublock0.uxpTest.script': options.script } : {}),
+        ...options.prefs,
     });
     fs.copyFileSync(xpi, path.join(profileDir, 'extensions', `${ADDON_ID}.xpi`));
     return profileDir;
@@ -181,6 +202,36 @@ const killTree = function(child) {
     }
 };
 
+// Screen captures the harness asks for (captureScreen() there): a file
+// <name>.capture-request with the browser's process ID, answered with
+// <name>.captured: "ok", "ok, popup left out" (another application's window
+// was over it) or why there is no capture. Taken from here: a process the browser
+// started would take the focus, and the browser would close its popups.
+const answerCaptureRequests = function(outDir) {
+    if ( fs.existsSync(outDir) === false ) { return; }
+    for ( const entry of fs.readdirSync(outDir) ) {
+        if ( entry.endsWith('.capture-request') === false ) { continue; }
+        const request = path.join(outDir, entry);
+        const name = entry.slice(0, -'.capture-request'.length);
+        const pid = fs.readFileSync(request, 'utf8').trim();
+        fs.rmSync(request, { force: true });
+        let result = 'ok';
+        try {
+            const stdout = execFileSync('powershell.exe', [
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-File', path.join(ROOT, 'tools', 'uxp-capture.ps1'),
+                '-ProcessId', pid, '-OutFile', path.join(outDir, name),
+            ], { stdio: 'pipe', windowsHide: true, timeout: 30000 });
+            if ( String(stdout).includes('occluded') ) {
+                result = 'ok, popup left out';
+            }
+        } catch (ex) {
+            result = String(ex.stderr || ex.message).trim().split('\n')[0] || 'failed';
+        }
+        fs.writeFileSync(path.join(outDir, `${name}.captured`), result);
+    }
+};
+
 // Resolves with 'done' (harness finished), 'exited' (browser quit without
 // finishing) or 'timeout'.
 const waitForRun = function(child, doneFile, timeoutMs) {
@@ -190,6 +241,9 @@ const waitForRun = function(child, doneFile, timeoutMs) {
         const started = Date.now();
         const tick = ( ) => {
             if ( fs.existsSync(doneFile) ) { return resolve('done'); }
+            if ( process.platform === 'win32' ) {
+                answerCaptureRequests(path.dirname(doneFile));
+            }
             if ( exited ) { return resolve('exited'); }
             if ( Date.now() - started > timeoutMs ) { return resolve('timeout'); }
             setTimeout(tick, 250);
