@@ -219,16 +219,27 @@ const Context = class {
     }
 
     // A page value which may be a thenable, as a chrome Promise of a chrome
-    // value.
+    // value. It rejects if the page unloads first: a page gone never
+    // settles its Promises, and whoever waits for them (a request held for
+    // a blocking listener's answer) would wait forever.
     awaitPage(value) {
         const waived = Cu.waiveXrays(value);
         if ( waived === null || typeof waived !== 'object' || typeof waived.then !== 'function' ) {
             return Promise.resolve(this.cloneIn(value));
         }
+        if ( this.unloaded ) {
+            return Promise.reject(new ExtensionError('The page unloaded'));
+        }
         return new Promise((resolve, reject) => {
+            const gone = ( ) => { reject(new ExtensionError('The page unloaded')); };
+            this.callOnUnload(gone);
             waived.then(
-                this.exportFunction(v => { resolve(this.cloneIn(v)); }),
+                this.exportFunction(v => {
+                    this.forgetOnUnload(gone);
+                    resolve(this.cloneIn(v));
+                }),
                 this.exportFunction(e => {
+                    this.forgetOnUnload(gone);
                     reject(new ExtensionError(e && e.message || String(e)));
                 })
             );

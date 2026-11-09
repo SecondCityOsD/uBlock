@@ -82,9 +82,17 @@ const appShell = Cc['@mozilla.org/appshell/appShellService;1']
 /******************************************************************************/
 
 // Run `fn` as a separate task, the way messages between extension contexts
-// are delivered in Firefox.
+// are delivered in Firefox. A task still queued when the runtime stops is
+// dropped (Extension.shutdown()): it would run in a stopped runtime, this
+// module's globals maybe already wiped by Cu.unload() (bootstrap.js). The
+// task reads only its own closure to know.
+const tasks = { running: true };
+
 var dispatch = function(fn) {
-    Services.tm.mainThread.dispatch(fn, Ci.nsIThread.DISPATCH_NORMAL);
+    const queue = tasks;
+    Services.tm.mainThread.dispatch(( ) => {
+        if ( queue.running ) { fn(); }
+    }, Ci.nsIThread.DISPATCH_NORMAL);
 };
 
 const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -738,27 +746,34 @@ var Extension = class {
         await this.startBackground();
     }
 
+    // Each step on its own: one that fails doesn't keep the others from
+    // undoing what they have to (observers, requests held, the toolbar
+    // button, the browser's settings).
     shutdown() {
         if ( this.shutdownStarted ) { return; }
         this.shutdownStarted = true;
-        Services.obs.removeObserver(this, 'document-element-inserted');
-        Services.obs.removeObserver(this, 'inner-window-destroyed');
-        Services.console.unregisterListener(this.consoleListener);
-        this.slowScriptLimit.restore();
-        for ( const context of Array.from(this.contexts.values()) ) {
-            context.unload();
-        }
-        this.contexts.clear();
-        if ( this.background !== null ) {
-            this.background.stop();
-            this.background = null;
-        }
-        for ( const callback of this.shutdownCallbacks.reverse() ) {
+        tasks.running = false;
+        const step = fn => {
             try {
-                callback();
+                fn();
             } catch (ex) {
                 Cu.reportError(ex);
             }
+        };
+        step(( ) => { Services.obs.removeObserver(this, 'document-element-inserted'); });
+        step(( ) => { Services.obs.removeObserver(this, 'inner-window-destroyed'); });
+        step(( ) => { Services.console.unregisterListener(this.consoleListener); });
+        step(( ) => { this.slowScriptLimit.restore(); });
+        for ( const context of Array.from(this.contexts.values()) ) {
+            step(( ) => { context.unload(); });
+        }
+        this.contexts.clear();
+        if ( this.background !== null ) {
+            step(( ) => { this.background.stop(); });
+            this.background = null;
+        }
+        for ( const callback of this.shutdownCallbacks.reverse() ) {
+            step(callback);
         }
         this.shutdownCallbacks = [];
     }

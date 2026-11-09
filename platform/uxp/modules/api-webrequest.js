@@ -287,7 +287,9 @@ TracingListener.prototype.QueryInterface = XPCOMUtils.generateQI([
 // gets what the extension writes, and the end of the response once the
 // extension closes or disconnects the filter. As in Firefox, a redirected
 // channel's filter fails and its response passes through unfiltered, and
-// the response goes on unfiltered when the extension page goes away.
+// the response goes on unfiltered when the extension page goes away; then,
+// beyond Firefox, what the filter gave the extension goes on first, if the
+// extension had written nothing yet (onUnload).
 //
 // Events fire from the channel's own callbacks rather than from a later
 // task: uBO writes and closes from its onstop handler, so a document gets
@@ -328,8 +330,20 @@ const StreamFilter = class {
         this.passThrough = false;   // data goes on as it comes
         this.heldStop = null;       // the channel's end, until the extension is done
         this.suspended = false;
+        // What the extension was given while it has written nothing. Should
+        // its page go away then, that goes on first, so that the page loads
+        // whole: uBO's HTML filtering takes a whole document before writing.
+        this.unwritten = [];
+        this.written = false;
         this.onUnload = ( ) => {
-            if ( FILTER_OPEN.has(this.status) ) { this.letThrough('disconnected', ''); }
+            if ( FILTER_OPEN.has(this.status) === false ) { return; }
+            for ( const data of this.unwritten ) {
+                const stream = Cc['@mozilla.org/io/arraybuffer-input-stream;1']
+                    .createInstance(Ci.nsIArrayBufferInputStream);
+                stream.setData(data, 0, data.byteLength);
+                this.forward(stream, data.byteLength);
+            }
+            this.letThrough('disconnected', '');
         };
         context.callOnUnload(this.onUnload);
         this.page = this.makePageObject();
@@ -414,6 +428,7 @@ const StreamFilter = class {
     letThrough(status, error) {
         this.status = status;
         this.error = error;
+        this.unwritten = [];
         this.passThrough = true;
         this.resumeChannel();
         if ( this.heldStop !== null ) { this.stopChain(this.heldStop); }
@@ -436,6 +451,8 @@ const StreamFilter = class {
         if ( bytes instanceof Uint8Array === false ) {
             throw new ExtensionError('StreamFilter.write: data must be an ArrayBuffer or a Uint8Array');
         }
+        this.written = true;
+        this.unwritten = [];
         if ( bytes.byteLength === 0 ) { return; }
         const stream = Cc['@mozilla.org/io/arraybuffer-input-stream;1']
             .createInstance(Ci.nsIArrayBufferInputStream);
@@ -450,6 +467,7 @@ const StreamFilter = class {
             throw new ExtensionError(`StreamFilter.close: invalid state (${this.status})`);
         }
         this.status = 'closed';
+        this.unwritten = [];
         this.resumeChannel();
         this.stopChain(NS_OK);
         this.context.forgetOnUnload(this.onUnload);
@@ -508,6 +526,7 @@ const StreamFilter = class {
         // Read even when dropped: a listener consumes what it is given.
         const data = bytesOfStream(stream, count);
         if ( this.status === 'closed' ) { return; }
+        if ( this.written === false ) { this.unwritten.push(data); }
         this.fire('data', { data });
     }
 
@@ -546,6 +565,9 @@ const WebRequestService = class {
         // Requests a stream filter can still be attached to, by request ID:
         // until their response starts.
         this.live = new Map();
+        // What lets go of each request held for a blocking listener's
+        // Promise: stop() does, the extension's answer won't come.
+        this.held = new Set();
         this.events = {};
         for ( const name of EVENT_NAMES ) {
             this.events[name] = new EventManager(`webRequest.${name}`, name === 'onBeforeRequest'
@@ -559,6 +581,9 @@ const WebRequestService = class {
         }
     }
 
+    // The requests held for the extension's answer go on without it, as in
+    // Firefox when an extension goes away. What their listeners' Promises
+    // do later is ignored: this.stopped, the only state they read first.
     stop() {
         this.stopped = true;
         Services.obs.removeObserver(this, MODIFY_TOPIC);
@@ -566,6 +591,9 @@ const WebRequestService = class {
             Services.obs.removeObserver(this, topic);
         }
         this.endPriming();
+        for ( const release of Array.from(this.held) ) {
+            release();
+        }
         this.live.clear();
     }
 
@@ -768,7 +796,8 @@ const WebRequestService = class {
             const waived = Cu.waiveXrays(value);
             if ( waived !== null && typeof waived === 'object' && typeof waived.then === 'function' ) {
                 outcome.async.push(context.awaitPage(value).catch(reason => {
-                    Cu.reportError(reason);
+                    // A page gone (context.awaitPage()) is no listener's error.
+                    if ( context.unloaded === false ) { Cu.reportError(reason); }
                     return null;
                 }));
                 continue;
@@ -830,11 +859,13 @@ const WebRequestService = class {
     }
 
     // onBeforeRequest, then onBeforeSendHeaders, then onSendHeaders; any
-    // phase may wait for Promises, the channel stays suspended meanwhile.
+    // phase may wait for Promises, the channel stays suspended meanwhile,
+    // held until they settle or the service stops (stop()).
     runRequestPhases(request, suspended) {
         const phases = [ 'onBeforeRequest', 'onBeforeSendHeaders', 'onSendHeaders' ];
         let i = 0;
         const resume = ( ) => {
+            this.held.delete(resume);
             if ( suspended === false ) { return; }
             suspended = false;
             try {
@@ -852,10 +883,13 @@ const WebRequestService = class {
                     request.channel.suspend();
                     suspended = true;
                 }
+                this.held.add(resume);
                 Promise.all(outcome.async).then(values => {
+                    if ( this.stopped ) { return; }
                     if ( this.apply(request, phase, values) ) { return resume(); }
                     next();
                 }).catch(reason => {
+                    if ( this.stopped ) { return; }
                     Cu.reportError(reason);
                     resume();
                 });
@@ -876,19 +910,28 @@ const WebRequestService = class {
             this.maybeRedirected(request, response);
             return;
         }
+        // Held until the Promises settle or the service stops (stop()).
         channel.suspend();
-        Promise.all(outcome.async).then(values => {
-            if ( this.apply(request, 'onHeadersReceived', values) === false ) {
-                this.maybeRedirected(request, response);
-            }
-        }).catch(reason => {
-            Cu.reportError(reason);
-        }).then(( ) => {
+        let suspended = true;
+        const resume = ( ) => {
+            this.held.delete(resume);
+            if ( suspended === false ) { return; }
+            suspended = false;
             try {
                 channel.resume();
             } catch {
             }
-        });
+        };
+        this.held.add(resume);
+        Promise.all(outcome.async).then(values => {
+            if ( this.stopped ) { return; }
+            if ( this.apply(request, 'onHeadersReceived', values) === false ) {
+                this.maybeRedirected(request, response);
+            }
+        }).catch(reason => {
+            if ( this.stopped ) { return; }
+            Cu.reportError(reason);
+        }).then(resume);
     }
 
     maybeRedirected(request, response) {
