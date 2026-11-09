@@ -85,8 +85,10 @@ const appShell = Cc['@mozilla.org/appshell/appShellService;1']
 // are delivered in Firefox. A task still queued when the runtime stops is
 // dropped (Extension.shutdown()): it would run in a stopped runtime, this
 // module's globals maybe already wiped by Cu.unload() (bootstrap.js). The
-// task reads only its own closure to know.
-const tasks = { running: true };
+// task reads only its own closure to know. Each runtime has its own
+// `tasks` (see Extension's constructor): runtime.reload() starts the next
+// one in this same module, whose tasks must run.
+let tasks = { running: true };
 
 var dispatch = function(fn) {
     const queue = tasks;
@@ -689,6 +691,8 @@ var Extension = class {
         this.startupReason = reason;
         this.previousVersion = data.oldVersion;
         this.hooks = hooks;
+        tasks = { running: true };
+        this.tasks = tasks;
         this.uuid = '';
         this.baseURI = null;
         this.origin = '';
@@ -748,11 +752,13 @@ var Extension = class {
 
     // Each step on its own: one that fails doesn't keep the others from
     // undoing what they have to (observers, requests held, the toolbar
-    // button, the browser's settings).
-    shutdown() {
+    // button, the browser's settings). `closePages`: the extension goes
+    // away (a disable, an uninstall), see closePages(); otherwise its pages
+    // stay for the next runtime (see reloadOrphanPages()).
+    shutdown(closePages = false) {
         if ( this.shutdownStarted ) { return; }
         this.shutdownStarted = true;
-        tasks.running = false;
+        this.tasks.running = false;
         const step = fn => {
             try {
                 fn();
@@ -776,6 +782,92 @@ var Extension = class {
             step(callback);
         }
         this.shutdownCallbacks = [];
+        if ( closePages ) {
+            step(( ) => { this.closePages(); });
+        }
+    }
+
+    // The extension's pages in the browser's tabs.
+    * ownTabs() {
+        const windows = Services.wm.getEnumerator('navigator:browser');
+        while ( windows.hasMoreElements() ) {
+            const win = windows.getNext();
+            if ( win.closed || !win.gBrowser ) { continue; }
+            for ( const tab of win.gBrowser.tabs ) {
+                let url = '';
+                try {
+                    url = tab.linkedBrowser.currentURI.spec;
+                } catch {
+                }
+                if ( this.isOwnURL(url) ) { yield { win, tab }; }
+            }
+        }
+    }
+
+    // The page uBO's document-blocked.html stands in for (traffic.js:
+    // ?details=<JSON>, its `url`), or ''.
+    blockedPageOf(url) {
+        if ( url.startsWith(`${this.origin}/document-blocked.html?`) === false ) { return ''; }
+        try {
+            const match = /[?&]details=([^&#]+)/.exec(url);
+            const blocked = JSON.parse(decodeURIComponent(match[1])).url;
+            if ( /^https?:\/\//.test(blocked) ) { return blocked; }
+        } catch {
+        }
+        return '';
+    }
+
+    // A disable or an uninstall closes the extension's pages, as Firefox
+    // does: left open, they would run on without an API (the dashboard
+    // retrying forever). A window left with no tab gets a new one; a
+    // popup window (the logger's) closes. A page uBO blocked, in its tab,
+    // loads instead: nothing blocks it any more.
+    closePages() {
+        const byWindow = new Map();
+        for ( const { win, tab } of Array.from(this.ownTabs()) ) {
+            const blocked = this.blockedPageOf(tab.linkedBrowser.currentURI.spec);
+            if ( blocked !== '' ) {
+                tab.linkedBrowser.loadURI(blocked);
+                continue;
+            }
+            if ( byWindow.has(win) === false ) { byWindow.set(win, []); }
+            byWindow.get(win).push(tab);
+        }
+        for ( const [ win, tabs ] of byWindow ) {
+            const { gBrowser } = win;
+            if ( tabs.length === gBrowser.tabs.length ) {
+                if ( win.toolbar.visible === false ) {
+                    win.close();
+                    continue;
+                }
+                const url = typeof win.BROWSER_NEW_TAB_URL === 'string'
+                    ? win.BROWSER_NEW_TAB_URL
+                    : 'about:blank';
+                gBrowser.selectedTab = gBrowser.addTab(url, {});
+            }
+            for ( const tab of tabs ) {
+                gBrowser.removeTab(tab, { animate: false });
+            }
+        }
+    }
+
+    // After an upgrade or a runtime.reload(), the pages the stopped runtime
+    // left open have no API (their context went with it); reloaded, they
+    // get this runtime's, and stay where the user had them. Once this
+    // runtime's background page has loaded: theirs to talk to. A page with
+    // a context of this runtime is left as it is; so is every page at the
+    // browser's launch (none is older than the runtime).
+    reloadOrphanPages() {
+        for ( const { tab } of Array.from(this.ownTabs()) ) {
+            const browser = tab.linkedBrowser;
+            let innerWindowID = 0;
+            try {
+                innerWindowID = windowUtilsOf(browser.contentWindow).currentInnerWindowID;
+            } catch {
+            }
+            if ( this.contexts.has(innerWindowID) ) { continue; }
+            browser.reload();
+        }
     }
 
     onShutdown(callback) {
@@ -1092,10 +1184,12 @@ var Extension = class {
             Cu.reportError(ex);
             return;
         }
-        // runtime.onInstalled/onStartup: once, not again after a restart.
+        // runtime.onInstalled/onStartup: once, not again after a restart;
+        // then the pages a stopped runtime left (reloadOrphanPages()).
         if ( viewType === 'background' && this.backgroundLoads++ === 0 ) {
             win.addEventListener('load', ( ) => {
                 this.coreAPIs.onBackgroundLoaded(this.startupReason);
+                this.reloadOrphanPages();
             }, { once: true });
         }
     }

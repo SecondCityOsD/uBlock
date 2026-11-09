@@ -34,6 +34,7 @@ var { createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE } = (( ) => {
 // admin's, which outlives the add-on.
 const PREF_MANAGED_STORAGE = 'extensions.ublock0.managedStorage';
 const NO_RECEIVER = 'Could not establish connection. Receiving end does not exist.';
+const NO_LATE_RESPONSE = 'Promised response from onMessage listener went out of scope';
 
 // bootstrap.js reasons
 const APP_STARTUP = 1;
@@ -224,10 +225,28 @@ const Messaging = class {
             dispatch(( ) => {
                 let settled = false;
                 let pending = 0;
+                // Receivers which will answer later (their listener
+                // returned true), each watched until the message settles:
+                // when the last one unloads without answering, the message
+                // fails, as in Firefox, rather than leaving its sender
+                // waiting.
+                const watched = [];
                 const settle = (ok, value) => {
                     if ( settled ) { return; }
                     settled = true;
+                    for ( const [ ctx, gone ] of watched ) {
+                        ctx.forgetOnUnload(gone);
+                    }
                     (ok ? resolve : reject)(value);
+                };
+                const watch = other => {
+                    const gone = ( ) => {
+                        pending -= 1;
+                        if ( pending !== 0 ) { return; }
+                        settle(false, new ExtensionError(NO_LATE_RESPONSE));
+                    };
+                    other.callOnUnload(gone);
+                    watched.push([ other, gone ]);
                 };
                 for ( const other of receivers ) {
                     if ( other.unloaded ) { continue; }
@@ -242,6 +261,7 @@ const Messaging = class {
                     for ( const { value } of results ) {
                         if ( value === true ) {
                             pending += 1;
+                            watch(other);
                             continue;
                         }
                         const waived = Cu.waiveXrays(value);
@@ -269,8 +289,16 @@ const Messaging = class {
 // storage.session in memory; storage.managed comes from a JSON pref, the
 // natural admin channel on UXP (it can be locked through autoconfig).
 
+// A result which can't be read (it throws) rejects too: left pending, the
+// caller would wait forever.
 const idbResult = request => new Promise((resolve, reject) => {
-    request.onsuccess = ( ) => { resolve(request.result); };
+    request.onsuccess = ( ) => {
+        try {
+            resolve(request.result);
+        } catch (ex) {
+            reject(ex);
+        }
+    };
     request.onerror = ( ) => { reject(request.error); };
 });
 
@@ -330,7 +358,13 @@ const StorageService = class {
                     db.createObjectStore(area);
                 }
             };
-            this.dbPromise = idbResult(request);
+            // A failed open is tried again by the next call, rather than
+            // failing every call from then on.
+            const promise = idbResult(request).catch(reason => {
+                if ( this.dbPromise === promise ) { this.dbPromise = null; }
+                throw reason;
+            });
+            this.dbPromise = promise;
         }
         return this.dbPromise;
     }
@@ -469,6 +503,17 @@ const StorageService = class {
         this.notify(area, changes);
     }
 
+    // The keys alone, as recent Chrome and Firefox have it: no value read
+    // (uBO lists its cache's keys, some of whose values weigh megabytes).
+    async getKeys(area) {
+        if ( area === 'session' ) {
+            return Array.from(this.session.keys());
+        }
+        const db = await this.database();
+        const store = db.transaction(area, 'readonly').objectStore(area);
+        return idbResult(store.getAllKeys());
+    }
+
     // Chrome's definition: key length + JSON length of the value.
     async getBytesInUse(area, keys) {
         const items = await this.get(area, keys === undefined ? null : keys);
@@ -518,6 +563,7 @@ const StorageService = class {
     namespace() {
         const area = name => ({
             get: apiAsync((context, keys) => this.get(name, keys)),
+            getKeys: apiAsync(( ) => this.getKeys(name)),
             set: apiAsync((context, items) => this.set(name, items)),
             remove: apiAsync((context, keys) => this.remove(name, keys)),
             clear: apiAsync(( ) => this.clear(name)),

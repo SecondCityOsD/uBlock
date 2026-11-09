@@ -143,8 +143,17 @@ const Context = class {
         return Cu.waiveXrays(Cu.createObjectIn(this.waived));
     }
 
+    // A function the page can call. Once this context has unloaded (its
+    // page gone, or the runtime stopped), a call does nothing: none of the
+    // runtime's code runs, its module's globals maybe already wiped by
+    // Cu.unload() (bootstrap.js). Such calls come from pages closing as the
+    // runtime stops (uBO's logger releasing its view on beforeunload).
     exportFunction(fn, target = this.waived) {
-        return Cu.exportFunction(fn, target);
+        const context = this;
+        return Cu.exportFunction(function(...args) {
+            if ( context.unloaded ) { return; }
+            return fn.apply(this, args);
+        }, target);
     }
 
     pageError(reason) {

@@ -167,6 +167,11 @@ const openDatabase = function(name) {
     return databases.get(name);
 };
 
+// Resolves with whether all `entries` were written. A transaction aborted
+// from outside (the extension stopped, its page and so this worker gone)
+// fails each write with an AbortError: the transaction tells it already,
+// so those are not reported as errors too. Any other error aborts the
+// transaction, and is reported, as it would be.
 const store = async function({ dbName, storeName, entries }) {
     const db = await openDatabase(dbName);
     return new Promise(resolve => {
@@ -174,8 +179,12 @@ const store = async function({ dbName, storeName, entries }) {
         transaction.oncomplete = ( ) => { resolve(true); };
         transaction.onerror = transaction.onabort = ( ) => { resolve(false); };
         const objectStore = transaction.objectStore(storeName);
+        const onerror = ev => {
+            const { error } = ev.target;
+            if ( error && error.name === 'AbortError' ) { ev.preventDefault(); }
+        };
         for ( const { key, value } of entries ) {
-            objectStore.put({ key, value: withTexts(value) });
+            objectStore.put({ key, value: withTexts(value) }).onerror = onerror;
         }
     });
 };

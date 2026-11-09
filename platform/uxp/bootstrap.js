@@ -57,9 +57,9 @@ const packageHasFile = function(data, path) {
 const startExtension = function(data, reason) {
     const { Extension } = Cu.import(RUNTIME_URL, {});
     extension = new Extension(data, reason, {
-        // runtime.reload()
+        // runtime.reload(): its pages stay, for the new runtime to reload.
         reload: ( ) => {
-            stopExtension();
+            stopExtension(false);
             startExtension(data, ADDON_ENABLE);
         },
     });
@@ -69,9 +69,11 @@ const startExtension = function(data, reason) {
     extension.startup().catch(reason => { Cu.reportError(reason); });
 };
 
-const stopExtension = function() {
+// `closePages`: the extension goes away (a disable, an uninstall), its
+// pages with it (see Extension.shutdown()).
+const stopExtension = function(closePages) {
     if ( extension === null ) { return; }
-    extension.shutdown();
+    extension.shutdown(closePages);
     extension = null;
 };
 
@@ -98,7 +100,7 @@ function shutdown(data, reason) {
         if ( extension !== null ) { extension.onAppShutdown(); }
         return;
     }
-    stopExtension();
+    stopExtension(reason === ADDON_DISABLE || reason === ADDON_UNINSTALL);
     Cu.unload(RUNTIME_URL);
     if ( harness !== null ) {
         harness.stop();

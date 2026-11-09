@@ -70,6 +70,24 @@ const holdInFastCache = async function(rawbin, keys) {
     return held;
 };
 
+// [uBlock-UXP] The copies storage.local has of what IndexedDB holds alone,
+// written by versions from before it did: set() removes such a copy only
+// when it writes its key again, which a compiled list's may not be for
+// days. After an upgrade they weighed 68 MB (a 47 MB selfie), all read by
+// any storage.local.get(null). Their keys only, through getKeys().
+const removeStaleCopies = async function() {
+    if ( fastCache !== 'indexedDB' ) { return; }
+    if ( extensionStorage.getKeys instanceof Function === false ) { return; }
+    try {
+        const stale = (await extensionStorage.getKeys()).filter(fastCacheOnly);
+        if ( stale.length === 0 ) { return; }
+        ubolog(`cacheStorage: removing ${stale.length} stale copies from storage.local`);
+        await extensionStorage.remove(stale);
+    } catch (reason) {
+        ubolog(reason);
+    }
+};
+
 /*******************************************************************************
  * 
  * Extension storage
@@ -154,14 +172,17 @@ const cacheStorage = (( ) => {
             });
         },
 
+        // [uBlock-UXP] storage.local's keys through getKeys() where there
+        // is one, rather than all its values read to know them.
         async keys(regex) {
             const results = await Promise.all([
                 cacheAPIs[fastCache].keys(regex),
-                extensionStorage.get(null).catch(( ) => {}),
+                extensionStorage.getKeys instanceof Function
+                    ? extensionStorage.getKeys().catch(( ) => [])
+                    : extensionStorage.get(null).then(bin => Object.keys(bin || {}), ( ) => []),
             ]);
             const keys = new Set(results[0]);
-            const bin = results[1] || {};
-            for ( const key of Object.keys(bin) ) {
+            for ( const key of results[1] ) {
                 if ( regex && regex.test(key) === false ) { continue; }
                 keys.add(key);
             }
@@ -226,13 +247,17 @@ const cacheStorage = (( ) => {
             });
         },
 
+        // [uBlock-UXP] Once the fast cache is chosen (at launch), the stale
+        // copies go (removeStaleCopies()).
         select(api) {
-            if ( Object.hasOwn(cacheAPIs, api) === false ) { return fastCache; }
-            fastCache = api;
-            for ( const k of Object.keys(cacheAPIs) ) {
-                if ( k === api ) { continue; }
-                cacheAPIs[k]['clear']();
+            if ( Object.hasOwn(cacheAPIs, api) ) {
+                fastCache = api;
+                for ( const k of Object.keys(cacheAPIs) ) {
+                    if ( k === api ) { continue; }
+                    cacheAPIs[k]['clear']();
+                }
             }
+            removeStaleCopies();
             return fastCache;
         },
     };

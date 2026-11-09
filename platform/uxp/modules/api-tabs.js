@@ -27,7 +27,7 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, setTimeout, dispatch,
+/* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, dispatch,
           MatchPattern, outerWindowIdOf, EventManager, ExtensionError,
           apiAsync */
 /* exported createTabsAPIs, errorNameOf */
@@ -126,19 +126,6 @@ const windowStateOf = function(win) {
     }
 };
 
-const whenWindowReady = function(win) {
-    return new Promise(resolve => {
-        const check = ( ) => {
-            if ( win.closed ) { return resolve(false); }
-            if ( win.document.readyState === 'complete' && win.gBrowser ) {
-                return resolve(true);
-            }
-            setTimeout(check, 50);
-        };
-        check();
-    });
-};
-
 // [tabId], [object] argument forms of tabs.update() and tabs.reload().
 const tabIdAndObject = args => typeof args[0] === 'number'
     ? [ args[0], args[1] || {} ]
@@ -153,6 +140,10 @@ const TabTracker = class {
         this.browsers = new Map();
         this.nextId = 1;
         this.windows = new Set();
+        // Windows opened and not loaded yet: their load listener, and who
+        // waits for them (see whenLoaded()).
+        this.loadingWindows = new Map();
+        this.stopped = false;
         this.selectedTabIds = new WeakMap();
         this.openerPending = new WeakSet();
         this.locations = new WeakMap();
@@ -228,7 +219,11 @@ const TabTracker = class {
     }
 
     stop() {
+        this.stopped = true;
         Services.ww.unregisterNotification(this.windowWatcher);
+        for ( const win of Array.from(this.loadingWindows.keys()) ) {
+            this.settleLoading(win, false);
+        }
         for ( const win of Array.from(this.windows) ) {
             this.detachWindow(win);
         }
@@ -445,16 +440,54 @@ const TabTracker = class {
         }
     }
 
+    // Resolves once `win` has loaded: true for a browser window (its
+    // tabbrowser is built by then), false for any other window, one closed
+    // first, or once the tracker stops. The window's own load event: other
+    // windows (dialogs, the Browser Console) cost nothing while they live.
+    whenLoaded(win) {
+        const doc = win.document;
+        if ( doc.readyState === 'complete' && doc.documentURI !== 'about:blank' ) {
+            return Promise.resolve(isBrowserWindow(win) && win.gBrowser !== undefined);
+        }
+        if ( this.stopped ) { return Promise.resolve(false); }
+        let loading = this.loadingWindows.get(win);
+        if ( loading === undefined ) {
+            loading = {
+                onLoad: ( ) => {
+                    this.settleLoading(win, isBrowserWindow(win) && win.gBrowser !== undefined);
+                },
+                waiters: [],
+            };
+            this.loadingWindows.set(win, loading);
+            win.addEventListener('load', loading.onLoad);
+        }
+        return new Promise(resolve => { loading.waiters.push(resolve); });
+    }
+
+    settleLoading(win, ready) {
+        const loading = this.loadingWindows.get(win);
+        if ( loading === undefined ) { return; }
+        this.loadingWindows.delete(win);
+        win.removeEventListener('load', loading.onLoad);
+        for ( const resolve of loading.waiters ) {
+            resolve(ready);
+        }
+    }
+
+    // What runs once a window has loaded reads `this.stopped` first: the
+    // module's globals may be gone by then.
     onWindowWatcher(win, topic) {
         if ( topic === 'domwindowopened' ) {
-            whenWindowReady(win).then(ready => {
-                if ( ready === false || isBrowserWindow(win) === false ) { return; }
+            this.whenLoaded(win).then(ready => {
+                if ( ready === false || this.stopped ) { return; }
                 this.attachWindow(win);
                 this.windowEvents.onCreated.fire(this.convertWindow(win));
             });
             return;
         }
-        if ( topic !== 'domwindowclosed' || this.windows.has(win) === false ) { return; }
+        if ( topic !== 'domwindowclosed' ) { return; }
+        this.settleLoading(win, false);
+        if ( this.windows.has(win) === false ) { return; }
         const windowId = this.windowIdOf(win);
         for ( const tab of Array.from(win.gBrowser.tabs) ) {
             const tabId = this.getId(tab.linkedBrowser);
@@ -902,7 +935,7 @@ const TabTracker = class {
         const arg = Cc['@mozilla.org/supports-string;1'].createInstance(Ci.nsISupportsString);
         arg.data = urls.length !== 0 ? urls[0] : 'about:blank';
         const win = Services.ww.openWindow(null, BROWSER_CHROME_URL, '_blank', features.join(','), arg);
-        if ( await whenWindowReady(win) === false ) {
+        if ( await this.whenLoaded(win) === false ) {
             throw new ExtensionError('The window could not be created');
         }
         for ( const url of urls.slice(1) ) {

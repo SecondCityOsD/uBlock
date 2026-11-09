@@ -2510,9 +2510,11 @@ const runUpdate = async function() {
 
 // Stop while busy: uBO disabled while a page loads, once while it boots
 // (the runtime holds the page's requests for uBO's answer), once while it
-// filters (its HTML filter reading the page's document, half arrived). The
-// pages must still finish, whole, the runtime must log nothing once
-// stopped, and uBO must block again once re-enabled. The add-on that comes
+// filters (its HTML filter reading the page's document, half arrived), a
+// window of another kind (a dialog) open from before that stop to after it.
+// The pages must still finish, whole, the runtime must log nothing once
+// stopped (nor keep watching the dialog), and uBO must block again once
+// re-enabled. The add-on that comes
 // back runs no scenario: this harness drives on to the end.
 
 const STOP_HOST = 'uxp-stop.test';
@@ -2666,6 +2668,9 @@ const runStopBusy = async function() {
 
         addon.userDisabled = false;
         report.restart1 = await probeBlocking(win, server, 90000);
+        const dialog = Services.ww.openWindow(null, 'chrome://global/content/config.xul',
+            '_blank', 'chrome,dialog=no,resizable', null);
+        await sleep(1000);
 
         // Stopped while filtering: the document half read by uBO's HTML
         // filter, an image and an XHR in flight.
@@ -2677,6 +2682,7 @@ const runStopBusy = async function() {
         await sleep(2000);
         report.filtering.errors = errorsSince(stoppedAt);
         win.gBrowser.removeTab(tab2);
+        dialog.close();
 
         addon.userDisabled = false;
         report.restart2 = await probeBlocking(win, server, 90000);
@@ -2710,6 +2716,268 @@ const runStopBusy = async function() {
     }
     return report;
 };
+
+/******************************************************************************/
+
+// Pages: uBO's pages when the runtime stops. A runtime.reload() keeps them,
+// reloaded and working with the new runtime. A disable closes them, as
+// Firefox does: a window left with none of its tabs keeps a new one, the
+// logger's popup window goes, a page uBO strict-blocked loads in the tab of
+// its document-blocked.html. Nothing logged by the runtime or by uBO's
+// pages. The add-on that comes back runs no scenario.
+
+const runPages = async function() {
+    const report = {};
+    const server = new TestServer(path => path === '/target.html'
+        ? { type: 'text/html; charset=utf-8', body: '<!doctype html><title>target</title><p>target</p>' }
+        : { status: 404, type: 'text/plain', body: '' });
+    server.start();
+    const BROWSER_URL = 'chrome://browser/content/browser.xul';
+    const openBrowserWindow = (url, features) => {
+        const arg = Cc['@mozilla.org/supports-string;1'].createInstance(Ci.nsISupportsString);
+        arg.data = url;
+        return Services.ww.openWindow(null, BROWSER_URL, '_blank', features, arg);
+    };
+    try {
+        const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+        const addon = await new Promise(resolve => { AddonManager.getAddonByID(addonData.id, resolve); });
+        prefs.setCharPref('scenario', '');
+        prefs.setBoolPref('keepConsoleLog', true);
+        const { ext, bgWindow } = await whenUBOReady();
+        const base = ext.getURL('');
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const pageIn = (browser, path) => waitFor(( ) => {
+            const d = browser.contentDocument;
+            return d && d.readyState === 'complete' && d.documentURI.startsWith(`${base}${path}`) ? d : null;
+        }, 30000, path);
+        const dashboardReady = browser => waitFor(( ) => {
+            const d = browser.contentDocument;
+            return d && d.documentURI.startsWith(`${base}dashboard.html`) && d.body &&
+                d.readyState === 'complete' && d.body.classList.contains('notReady') === false ? d : null;
+        }, 60000, 'the dashboard ready');
+
+        // runtime.reload(): the dashboard stays, reloaded, and works.
+        const dashTab = win.gBrowser.addTab(`${base}dashboard.html`);
+        const oldDoc = await dashboardReady(dashTab.linkedBrowser);
+        const reloadAt = Date.now();
+        callBackground(bgWindow, 'runtime.reload');
+        await waitFor(( ) => extension !== null && extension !== ext, 30000, 'the new runtime');
+        await whenUBOReady();
+        const newDoc = await dashboardReady(dashTab.linkedBrowser).catch(( ) => null);
+        await sleep(2000);
+        report.reload = {
+            tabOpen: dashTab.parentNode !== null,
+            reloaded: newDoc !== null && newDoc !== oldDoc,
+            ready: newDoc !== null,
+            errors: errorsSince(reloadAt),
+        };
+
+        // A disable: the dashboard tab in the main window, a window with
+        // only the dashboard, the logger in a popup window, a page uBO
+        // blocked.
+        const targetURL = `http://127.0.0.1:${server.port}/target.html`;
+        const blockedURL = `${base}document-blocked.html?details=${encodeURIComponent(JSON.stringify({
+            url: targetURL, hn: '127.0.0.1', dn: '127.0.0.1', fs: '||127.0.0.1^',
+        }))}`;
+        const blockedTab = win.gBrowser.addTab(blockedURL);
+        await pageIn(blockedTab.linkedBrowser, 'document-blocked.html');
+        const soloWin = openBrowserWindow(`${base}dashboard.html`, 'chrome,dialog=no,all');
+        const popupWin = openBrowserWindow(`${base}logger-ui.html`,
+            'chrome,dialog=no,resizable,minimizable,scrollbars');
+        await waitFor(( ) => soloWin.gBrowser && popupWin.gBrowser, 10000, 'the windows');
+        await pageIn(soloWin.gBrowser.selectedBrowser, 'dashboard.html');
+        await pageIn(popupWin.gBrowser.selectedBrowser, 'logger-ui.html');
+        await sleep(1000);
+        const disableAt = Date.now();
+        addon.userDisabled = true;
+        await waitFor(( ) => blockedTab.linkedBrowser.currentURI.spec === targetURL, 10000, 'the blocked page')
+            .catch(( ) => {});
+        await sleep(2000);
+        const ownURLs = w => w.closed || !w.gBrowser ? [] : Array.from(w.gBrowser.tabs,
+            t => t.linkedBrowser.currentURI.spec).filter(u => u.startsWith(base));
+        report.disable = {
+            mainWindowOwnTabs: ownURLs(win),
+            mainWindowTabs: win.gBrowser.tabs.length,
+            dashTabGone: dashTab.parentNode === null,
+            blockedTab: blockedTab.parentNode === null ? 'closed' : blockedTab.linkedBrowser.currentURI.spec,
+            soloWindow: soloWin.closed ? 'closed' : Array.from(soloWin.gBrowser.tabs,
+                t => t.linkedBrowser.currentURI.spec),
+            popupWasPopup: popupWin.closed ? null : popupWin.toolbar.visible === false,
+            popupWindowClosed: popupWin.closed,
+            errors: errorsSince(disableAt),
+        };
+        if ( soloWin.closed === false ) { soloWin.close(); }
+        if ( popupWin.closed === false ) { popupWin.close(); }
+        addon.userDisabled = false;
+        await sleep(3000);
+    } catch (ex) {
+        report.error = String(ex);
+    } finally {
+        server.stop();
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { reload = {}, disable = {} } = report;
+    const noErrors = e => e !== undefined && e.runtime.length === 0 && e.ubo.length === 0;
+    const tabsClosed = disable.dashTabGone === true &&
+        Array.isArray(disable.mainWindowOwnTabs) && disable.mainWindowOwnTabs.length === 0;
+    const windowKept = Array.isArray(disable.soloWindow) && disable.soloWindow.length === 1 &&
+        disable.soloWindow[0].startsWith('moz-extension:') === false;
+    const checks = {
+        reloadKeepsTab: pass(reload.tabOpen === true, reload.tabOpen),
+        reloadReloads: pass(reload.reloaded === true && reload.ready === true, reload),
+        reloadNoErrors: pass(noErrors(reload.errors), reload.errors),
+        disableClosesTabs: pass(tabsClosed, [ disable.dashTabGone, disable.mainWindowOwnTabs ]),
+        disableKeepsWindow: pass(windowKept, disable.soloWindow),
+        disableClosesPopup: pass(disable.popupWindowClosed === true, disable.popupWindowClosed),
+        disableLoadsBlocked: pass(typeof disable.blockedTab === 'string' && disable.blockedTab.endsWith('/target.html'),
+            disable.blockedTab),
+        disableNoErrors: pass(noErrors(disable.errors), disable.errors),
+    };
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        reload,
+        disable,
+        error: report.error,
+    };
+    return report;
+};
+
+/******************************************************************************/
+
+// Upgrade: the add-on installed again over itself while it runs, as an
+// update installs (ADDON_UPGRADE), with a dashboard tab open and the popup
+// used before. The instance that comes back runs the second stage: uBO
+// ready and blocking, the dashboard tab reloaded and working, one button,
+// at most one keyset (none without shortcuts), Basilisk's one panelview, no
+// popup left (nothing left by the runtime that stopped), nothing logged by the runtime or uBO since the upgrade.
+
+const UPGRADE_MARK = 'uxpBeforeUpgrade';
+
+const openPopupOf = function(win) {
+    if ( Services.appinfo.name !== 'Basilisk' ) {
+        win.document.getElementById('uBlock0-legacy-button').doCommand();
+        return;
+    }
+    const { CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {});
+    CustomizableUI.getWidget('ublock0-button').forWindow(win).node.dispatchEvent(
+        new win.CustomEvent('command', { bubbles: true, cancelable: true })
+    );
+};
+
+const popupLoaded = win => waitFor(( ) => {
+    const browser = findPopupBrowser(win);
+    const doc = browser && browser.contentDocument;
+    const hostname = doc && doc.getElementById('hostname');
+    return hostname && hostname.textContent.trim() !== '' ? browser : null;
+}, 30000, 'the popup');
+
+const dashboardIn = function(win, base) {
+    return Array.from(win.gBrowser.tabs).find(tab =>
+        tab.linkedBrowser.currentURI.spec.startsWith(`${base}dashboard.html`)
+    ) || null;
+};
+
+const dashboardReady = browser => waitFor(( ) => {
+    const doc = browser.contentDocument;
+    return doc && doc.readyState === 'complete' && doc.body &&
+        doc.body.classList.contains('notReady') === false ? doc : null;
+}, 60000, 'the dashboard ready');
+
+const upgradeStage1 = async function() {
+    const { ext } = await whenUBOReady();
+    const win = Services.wm.getMostRecentWindow('navigator:browser');
+    const tab = win.gBrowser.addTab(ext.getURL('dashboard.html'));
+    const doc = await dashboardReady(tab.linkedBrowser);
+    doc.documentElement.dataset[UPGRADE_MARK] = 'true';
+    openPopupOf(win);
+    const browser = await popupLoaded(win);
+    const panel = panelOf(browser);
+    if ( panel !== null ) { panel.hidePopup(); }
+    await sleep(1000);
+    prefs.setIntPref('upgradeStage', 2);
+    prefs.setCharPref('upgradeAt', String(Date.now()));
+    prefs.setBoolPref('keepConsoleLog', true);
+    // A copy of the installed package, installed over it.
+    const copy = outDir.clone();
+    copy.append('upgrade.xpi');
+    if ( copy.exists() ) { copy.remove(false); }
+    addonData.installPath.copyTo(outDir, 'upgrade.xpi');
+    const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+    AddonManager.getInstallForFile(copy, install => { install.install(); });
+    // This instance stops; the next one runs the second stage.
+    return new Promise(( ) => {});
+};
+
+const upgradeStage2 = async function() {
+    const report = {};
+    const upgradeAt = parseInt(getPref('upgradeAt', '0'), 10);
+    const server = new TestServer(stopRoutes);
+    server.start();
+    try {
+        const { ext, µb } = await whenUBOReady();
+        report.readyAfter = µb.supportStats.allReadyAfter;
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const doc = win.document;
+        const tab = dashboardIn(win, ext.getURL(''));
+        if ( tab === null ) {
+            report.dashboard = { open: false };
+        } else {
+            const dashboard = await dashboardReady(tab.linkedBrowser).catch(( ) => null);
+            report.dashboard = {
+                open: true,
+                reloaded: dashboard !== null &&
+                    dashboard.documentElement.dataset[UPGRADE_MARK] === undefined,
+                ready: dashboard !== null,
+            };
+        }
+        openPopupOf(win);
+        report.popup = await popupLoaded(win).then(( ) => 'loaded', ex => String(ex));
+        const browser = findPopupBrowser(win);
+        const panel = browser && panelOf(browser);
+        if ( panel && typeof panel.hidePopup === 'function' ) { panel.hidePopup(); }
+        // Counted with the popup closed: shown, Basilisk's panelview is in
+        // a panel's anonymous content, which querySelectorAll() misses.
+        await sleep(1000);
+        report.parts = {
+            buttons: doc.querySelectorAll('[id="ublock0-button"], [id="uBlock0-legacy-button"]').length,
+            keysets: doc.querySelectorAll('[id="ublock0-commands"]').length,
+            views: doc.querySelectorAll(`[id="${POPUP_VIEW_ID}"]`).length,
+            popupBrowsers: doc.querySelectorAll('.ublock0-popup-browser').length +
+                (doc.getElementById(POPUP_VIEW_ID)
+                    ? doc.getElementById(POPUP_VIEW_ID).querySelectorAll('.ublock0-popup-browser').length
+                    : 0),
+        };
+        report.blocking = await probeBlocking(win, server, 60000);
+        report.errors = errorsSince(upgradeAt);
+    } catch (ex) {
+        report.error = String(ex);
+    } finally {
+        server.stop();
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { dashboard = {}, parts = {}, blocking = {}, errors } = report;
+    const isBasilisk = Services.appinfo.name === 'Basilisk';
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks: {
+            ready: pass(typeof report.readyAfter === 'string', report.readyAfter),
+            dashboardReloaded: pass(dashboard.open === true && dashboard.reloaded === true &&
+                dashboard.ready === true, dashboard),
+            popup: pass(report.popup === 'loaded', report.popup),
+            oneOfEach: pass(parts.buttons === 1 && parts.keysets <= 1 &&
+                parts.views === (isBasilisk ? 1 : 0) && parts.popupBrowsers === 0, parts),
+            blocks: pass(blocking.blocked === true, blocking),
+            noErrors: pass(errors !== undefined && errors.runtime.length === 0 && errors.ubo.length === 0,
+                errors),
+        },
+        readyAfter: report.readyAfter,
+        error: report.error,
+    };
+    return report;
+};
+
+const runUpgrade = ( ) => getPref('upgradeStage', 1) === 1 ? upgradeStage1() : upgradeStage2();
 
 /******************************************************************************/
 
@@ -3223,6 +3491,8 @@ const scenarios = {
     'uninstall-disabled': ( ) => runUninstall(true),
     update: runUpdate,
     'stop-busy': runStopBusy,
+    pages: runPages,
+    upgrade: runUpgrade,
     stalls: runStalls,
     compile: runCompile,
 };
@@ -3234,6 +3504,7 @@ const SCENARIO_FILTERS = {
     ui: UI_FILTERS,
     filtering: FILTERING_FILTERS,
     'stop-busy': STOP_FILTERS,
+    upgrade: STOP_FILTERS,
     // Its pages opened while uBO reloads (testPage()).
     stalls: STOP_FILTERS,
 };
@@ -3249,6 +3520,7 @@ const SCENARIO_HOSTS = {
     cosmetic: COSMETIC_HOST,
     filtering: FILTERING_HOST,
     'stop-busy': STOP_HOST,
+    upgrade: STOP_HOST,
     stalls: STOP_HOST,
 };
 

@@ -420,10 +420,11 @@ const createNetworkAPIs = function(extension) {
     const dns = new DNSResolver();
     const privacy = new PrivacySettings();
     privacy.applyAll();
-    extension.onShutdown(( ) => {
-        dns.stop();
-        privacy.restoreAll();
-    });
+    // Each on its own (Extension.shutdown() runs each callback in a try): a
+    // failure of one must not leave the browser's privacy settings as uBO
+    // set them.
+    extension.onShutdown(( ) => { dns.stop(); });
+    extension.onShutdown(( ) => { privacy.restoreAll(); });
 
     const tree = {
         dns: {
