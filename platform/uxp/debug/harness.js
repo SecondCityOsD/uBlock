@@ -1414,6 +1414,24 @@ const runCosmetic = async function() {
 
 const UI_FILTERS = [ '||127.0.0.1^*/uxp-blocked/' ];
 
+// Basilisk's panelview for the popup (api-ui.js); while shown, it is in a
+// panelmultiview's anonymous content, which querySelector() does not search.
+const POPUP_VIEW_ID = 'PanelUI-webext-ublock0-button-view';
+
+const findPopupBrowser = function(win) {
+    const selector = '.ublock0-popup-browser';
+    const view = win.document.getElementById(POPUP_VIEW_ID);
+    return win.document.querySelector(selector) || view && view.querySelector(selector);
+};
+
+// The panel a node is in, or null.
+const panelOf = function(node) {
+    for ( let n = node; n !== null; n = n.parentNode ) {
+        if ( n.localName === 'panel' ) { return n; }
+    }
+    return null;
+};
+
 const uiRoutes = function(path, port) {
     if ( path !== '/ui.html' ) { return testRoutes(path, port); }
     return {
@@ -1509,19 +1527,11 @@ const runUI = async function() {
 
         const section = sectionRunner(report);
 
-        // Basilisk moves the view into a panelmultiview's anonymous content,
-        // which document.querySelector() does not search.
-        const findPopupBrowser = ( ) => {
-            const selector = '.ublock0-popup-browser';
-            const view = win.document.getElementById('ublock0-panel');
-            return win.document.querySelector(selector) || view && view.querySelector(selector);
-        };
-
         await section('popup', async ( ) => {
             button.doCommand();
-            const popupBrowser = await waitFor(findPopupBrowser, 5000, 'the popup'
+            const popupBrowser = await waitFor(( ) => findPopupBrowser(win), 5000, 'the popup'
             ).catch(ex => {
-                const view = win.document.getElementById('ublock0-panel');
+                const view = win.document.getElementById(POPUP_VIEW_ID);
                 report.popupDebug = {
                     view: view ? `in ${view.parentNode && view.parentNode.id}` : 'none',
                     panels: Array.from(win.document.querySelectorAll('panel'))
@@ -1553,7 +1563,7 @@ const runUI = async function() {
             }, 'popup.png');
             Cu.waiveXrays(popupDoc.defaultView).vAPI.closePopup();
             report.popupClosedItself = await waitFor(
-                ( ) => findPopupBrowser() === null,
+                ( ) => findPopupBrowser(win) === null,
                 5000, 'the popup to close'
             ).catch(( ) => false);
             report.browserWindowStillOpen = win.closed === false;
@@ -1711,6 +1721,166 @@ const runUI = async function() {
     if ( failure !== null ) {
         report.error = failure;
     }
+    return report;
+};
+
+/******************************************************************************/
+
+// Popup: in each place its button can be (Basilisk: the navigation bar,
+// the menu panel, the overflow panel; Pale Moon: the navigation bar), light
+// and dark, at its widest (firewall pane shown). The whole page shows (no
+// panel clips it), the panel has no frame of its own color around it and
+// an arrow of the page's color; the popup goes with its panel. Captures of
+// each, to look at.
+
+const runPopup = async function() {
+    const report = { cases: {} };
+    const server = new TestServer(uiRoutes);
+    server.start();
+    const isBasilisk = Services.appinfo.name === 'Basilisk';
+    let CUI = null;
+    if ( isBasilisk ) {
+        ({ CustomizableUI: CUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {}));
+    }
+    const buttonId = isBasilisk ? 'ublock0-button' : 'uBlock0-legacy-button';
+    const win = Services.wm.getMostRecentWindow('navigator:browser');
+    const doc = win.document;
+
+    const place = async where => {
+        if ( isBasilisk === false ) { return; }
+        CUI.addWidgetToArea(buttonId, where === 'menu-panel' ? CUI.AREA_PANEL : CUI.AREA_NAVBAR);
+        if ( where === 'overflow' ) {
+            win.restore();
+            await sleep(500);
+            win.resizeTo(420, 700);
+            await waitFor(( ) => doc.getElementById(buttonId).getAttribute('overflowedItem') === 'true',
+                5000, 'the button to overflow');
+        } else if ( win.windowState !== win.STATE_MAXIMIZED ) {
+            win.maximize();
+            await sleep(800);
+        }
+    };
+    const open = async ( ) => {
+        if ( isBasilisk === false ) {
+            doc.getElementById(buttonId).doCommand();
+            return;
+        }
+        const group = CUI.getWidget(buttonId);
+        const node = group.forWindow(win).node;
+        if ( group.areaType === CUI.TYPE_MENU_PANEL ) {
+            await win.PanelUI.show();
+        } else if ( node.getAttribute('overflowedItem') === 'true' ) {
+            await doc.getElementById('nav-bar').overflowable.show();
+        }
+        node.dispatchEvent(new win.CustomEvent('command', { bubbles: true, cancelable: true }));
+    };
+    const closeAll = ( ) => {
+        for ( const panel of doc.querySelectorAll('panel') ) {
+            if ( panel.state === 'open' ) { panel.hidePopup(); }
+        }
+        const browser = findPopupBrowser(win);
+        const panel = browser && panelOf(browser);
+        if ( panel && typeof panel.hidePopup === 'function' ) { panel.hidePopup(); }
+    };
+    const measure = async name => {
+        const browser = await waitFor(( ) => findPopupBrowser(win), 8000, 'the popup');
+        const popupDoc = await waitFor(( ) => {
+            const d = browser.contentDocument;
+            if ( !d || d.readyState !== 'complete' || !d.body ) { return null; }
+            if ( d.body.classList.contains('loading') ) { return null; }
+            const hostname = d.getElementById('hostname');
+            return hostname && hostname.textContent.trim() !== '' ? d : null;
+        }, 30000, 'the popup page');
+        await sleep(1500);
+        const panel = panelOf(browser);
+        const anon = cls => panel && doc.getAnonymousElementByAttribute(panel, 'class', cls);
+        const content = anon('panel-arrowcontent');
+        const arrow = anon('panel-arrow');
+        const cw = popupDoc.defaultView;
+        const shown = browser.getBoundingClientRect();
+        const contentStyle = content ? win.getComputedStyle(content) : null;
+        const out = {
+            panel: panel ? panel.id || panel.className : 'none',
+            // No width asked: fitted to its view (the menu panel).
+            asked: browser.style.width !== '' ? parseFloat(browser.style.width) : 'fitted',
+            view: Math.round(browser.parentNode.getBoundingClientRect().width),
+            shown: Math.round(shown.width),
+            viewport: `${cw.innerWidth}x${cw.innerHeight}`,
+            layout: popupDoc.documentElement.className,
+            pageBackground: cw.getComputedStyle(popupDoc.body).backgroundColor,
+            frameBackground: contentStyle ? contentStyle.backgroundColor : null,
+            framePadding: contentStyle
+                ? [ 'top', 'right', 'bottom', 'left' ].map(side => contentStyle.getPropertyValue(`padding-${side}`)).join(' ')
+                : null,
+            arrow: arrow ? win.getComputedStyle(arrow).listStyleImage.slice(0, 32) : null,
+        };
+        out.capture = await captureScreen(`popup-${name.replace(/ /g, '-')}.png`);
+        closeAll();
+        out.closed = await waitFor(( ) => findPopupBrowser(win) === null, 5000, 'the popup to go')
+            .catch(( ) => false);
+        await sleep(500);
+        return out;
+    };
+
+    try {
+        const { bgWindow } = await whenUBOReady();
+        win.maximize();
+        await sleep(1000);
+        await openTab(`http://127.0.0.1:${server.port}/ui.html`);
+        await callUBO(bgWindow, 'changeUserSettings', 'advancedUserEnabled', true);
+        await callUBO(bgWindow, 'changeUserSettings', 'popupPanelSections', 31);
+        const places = isBasilisk ? [ 'nav-bar', 'menu-panel', 'overflow' ] : [ 'nav-bar' ];
+        for ( const where of places ) {
+            for ( const theme of [ 'light', 'dark' ] ) {
+                const name = `${where} ${theme}`;
+                try {
+                    await callUBO(bgWindow, 'changeUserSettings', 'uiTheme', theme);
+                    await place(where);
+                    await open();
+                    report.cases[name] = await measure(name);
+                } catch (ex) {
+                    report.cases[name] = { error: String(ex) };
+                    closeAll();
+                    await sleep(500);
+                }
+            }
+        }
+        await place('nav-bar');
+    } finally {
+        server.stop();
+    }
+
+    const checks = {};
+    for ( const [ name, c ] of Object.entries(report.cases) ) {
+        const failures = [];
+        if ( c.error ) {
+            failures.push(c.error);
+        } else {
+            // The page is as wide as asked (fitted: as its view), and laid
+            // out at that width.
+            const wanted = c.asked === 'fitted' ? c.view : c.asked;
+            if ( Math.abs(c.shown - wanted) > 1 || Math.abs(parseInt(c.viewport, 10) - c.shown) > 1 ) {
+                failures.push(`asked ${c.asked}, view ${c.view}, shown ${c.shown}, viewport ${c.viewport}`);
+            }
+            if ( name.startsWith('menu-panel') === false ) {
+                // At its widest: the firewall pane beside the main one.
+                if ( c.asked < 400 ) { failures.push(`narrow (${c.asked})`); }
+                if ( c.framePadding !== '0px 0px 0px 0px' ) { failures.push(`padding ${c.framePadding}`); }
+                if ( c.frameBackground !== c.pageBackground ) {
+                    failures.push(`frame ${c.frameBackground}, page ${c.pageBackground}`);
+                }
+                if ( /^url\("data:image\/svg\+xml/.test(c.arrow) === false ) { failures.push(`arrow ${c.arrow}`); }
+            }
+            if ( c.closed !== true ) { failures.push('the popup stayed'); }
+        }
+        checks[name] = failures.length === 0 ? 'PASS' : `FAIL: ${failures.join('; ')}`;
+    }
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        cases: report.cases,
+        ownErrors: ownErrors(consoleLines),
+    };
     return report;
 };
 
@@ -3047,6 +3217,7 @@ const scenarios = {
     network: runNetwork,
     cosmetic: runCosmetic,
     ui: runUI,
+    popup: runPopup,
     filtering: runFiltering,
     uninstall: ( ) => runUninstall(false),
     'uninstall-disabled': ( ) => runUninstall(true),

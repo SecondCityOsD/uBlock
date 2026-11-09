@@ -45,6 +45,10 @@ const HTML_NS = 'http://www.w3.org/1999/xhtml';
 const BROWSER_URL = 'chrome://browser/content/browser.xul';
 const PALE_MOON_BUTTON_ID = 'uBlock0-legacy-button';
 const BASILISK_BUTTON_ID = 'ublock0-button';
+// The prefix is Firefox 52's for browserAction views: Basilisk's styles
+// give those views up to 800 pixels and no padding, 360 to other views.
+const BASILISK_VIEW_ID = `PanelUI-webext-${BASILISK_BUTTON_ID}-view`;
+const POPUP_PANEL_MARK = 'ublock0-popup';
 const PREF_BUTTON_PLACED = 'extensions.ublock0.toolbarButtonPlaced';
 const PREF_SHORTCUTS = 'extensions.ublock0.shortcuts';
 const POPUP_MAX_WIDTH = 800;
@@ -155,11 +159,61 @@ const ownURLOf = function(extension, path, baseURL) {
 
 /******************************************************************************/
 
+// The panel a node is in, or null.
+const panelOf = function(node) {
+    for ( let n = node; n !== null; n = n.parentNode ) {
+        if ( n.localName === 'panel' ) { return n; }
+    }
+    return null;
+};
+
+// The browser's panel arrow (chrome://global/skin/arrow/panelarrow-*.svg,
+// the same in Pale Moon and Basilisk), filled with `color`.
+const arrowImageOf = function(color, vertical) {
+    const svg = vertical
+        ? '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">' +
+          '<path d="M 0,10 L 10,0 20,10 z" fill="hsla(210,4%,10%,.2)"/>' +
+          `<path d="M 1,10 L 10,1 19,10 z" fill="${color}"/></svg>`
+        : '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="20">' +
+          '<path d="M 10,0 L 0,10 10,20 z" fill="hsla(210,4%,10%,.2)"/>' +
+          `<path d="M 10,1 L 1,10 10,19 z" fill="${color}"/></svg>`;
+    return cssURL(`data:image/svg+xml,${encodeURIComponent(svg)}`);
+};
+
+// A panel showing a popup has no padding, and the page's background color
+// (as in Firefox): no frame of the browser's own color around the page, an
+// arrow of the page's color. Before the page loads, the browser's colors.
+const POPUP_PANEL_STYLE = `
+panel[${POPUP_PANEL_MARK}] > .panel-arrowcontainer > .panel-arrowcontent {
+    padding: 0 !important;
+    background: var(--ublock0-popup-background, -moz-field) !important;
+}
+panel[${POPUP_PANEL_MARK}] .panel-arrow[side="top"],
+panel[${POPUP_PANEL_MARK}] .panel-arrow[side="bottom"] {
+    list-style-image: var(--ublock0-popup-arrow-vertical,
+        url("chrome://global/skin/arrow/panelarrow-vertical.svg")) !important;
+}
+panel[${POPUP_PANEL_MARK}] .panel-arrow[side="left"],
+panel[${POPUP_PANEL_MARK}] .panel-arrow[side="right"] {
+    list-style-image: var(--ublock0-popup-arrow-horizontal,
+        url("chrome://global/skin/arrow/panelarrow-horizontal.svg")) !important;
+}`;
+
+const POPUP_PANEL_PROPERTIES = [
+    '--ublock0-popup-background',
+    '--ublock0-popup-arrow-vertical',
+    '--ublock0-popup-arrow-horizontal',
+];
+
 // A popup page in a content <browser>, sized to its content (at most 800 by
 // 600, as in Firefox). It may close itself with window.close().
+//
+// `fitted`: the popup is as wide as its container, which the browser sizes
+// (Basilisk's menu panel, as with Firefox 52's popups there), and the page
+// is laid out for that width; else it is as wide as its page needs.
 
 const PopupView = class {
-    constructor(container, url, onClose) {
+    constructor(container, url, onClose, fitted = false) {
         const browser = container.ownerDocument.createElementNS(XUL_NS, 'browser');
         const attributes = {
             type: 'content',
@@ -174,17 +228,25 @@ const PopupView = class {
             browser.setAttribute(name, value);
         }
         // Wide at first: popup-fenix picks its layout from the width it
-        // gets; then shrunk to fit (see resize()).
-        browser.style.width = `${POPUP_MAX_WIDTH}px`;
+        // gets (its two panes side by side, or one above the other); then
+        // shrunk to fit (see resize()).
+        if ( fitted === false ) {
+            browser.style.width = `${POPUP_MAX_WIDTH}px`;
+        }
         browser.style.height = '1px';
         this.browser = browser;
         this.onClose = onClose;
+        this.fitted = fitted;
         this.observer = null;
         this.resizePending = false;
+        // The panel given the page's colors, and those colors.
+        this.panel = null;
+        this.color = '';
         for ( const type of PopupView.EVENTS ) {
             browser.addEventListener(type, this, true);
         }
         container.appendChild(browser);
+        this.paintPanel();
     }
 
     handleEvent(event) {
@@ -225,28 +287,83 @@ const PopupView = class {
         });
     }
 
-    // The document's preferred size, as sizeToContent() measures it (in
-    // device pixels, as Firefox's popups do).
+    // The document's preferred size within the largest a popup may be --
+    // fitted, the height it needs at the width it has -- measured as Firefox
+    // measures its popups (in device pixels).
     resize() {
         const { browser } = this;
         if ( browser === null ) { return; }
+        const maxWidth = this.fitted
+            ? Math.floor(browser.getBoundingClientRect().width)
+            : POPUP_MAX_WIDTH;
+        // Not laid out yet: a later event comes.
+        if ( maxWidth < 1 ) { return; }
         const width = {};
         const height = {};
         let ratio = 1;
         try {
-            browser.docShell.contentViewer.getContentSize(width, height);
             ratio = browser.contentWindow.devicePixelRatio || 1;
+            browser.docShell.contentViewer.getContentSizeConstrained(
+                maxWidth * ratio,
+                POPUP_MAX_HEIGHT * ratio,
+                width,
+                height
+            );
         } catch {
             return;
         }
         const size = (value, max) => Math.min(Math.max(Math.ceil(value / ratio), 1), max);
-        browser.style.width = `${size(width.value, POPUP_MAX_WIDTH)}px`;
+        if ( this.fitted === false ) {
+            browser.style.width = `${size(width.value, POPUP_MAX_WIDTH)}px`;
+        }
         browser.style.height = `${size(height.value, POPUP_MAX_HEIGHT)}px`;
+        this.paintPanel();
+    }
+
+    // The panel around the page gets POPUP_PANEL_STYLE, then the page's
+    // background color once it has one. Not Basilisk's menu panel: there
+    // the page is one view among the panel's.
+    paintPanel() {
+        const panel = panelOf(this.browser);
+        if ( panel !== this.panel ) {
+            this.unpaintPanel();
+            if ( panel === null || panel.id === 'PanelUI-popup' ) { return; }
+            panel.setAttribute(POPUP_PANEL_MARK, 'true');
+            this.panel = panel;
+        }
+        if ( this.panel === null ) { return; }
+        let color = '';
+        try {
+            const doc = this.browser.contentDocument;
+            color = doc.defaultView.getComputedStyle(doc.body).backgroundColor;
+        } catch {
+        }
+        // Opaque colors only: the panel shows what is beneath a transparent
+        // page.
+        if ( /^rgb\(/.test(color) === false || color === this.color ) { return; }
+        this.color = color;
+        const { style } = this.panel;
+        style.setProperty(POPUP_PANEL_PROPERTIES[0], color);
+        style.setProperty(POPUP_PANEL_PROPERTIES[1], arrowImageOf(color, true));
+        style.setProperty(POPUP_PANEL_PROPERTIES[2], arrowImageOf(color, false));
+    }
+
+    // Pale Moon's panel stays, for the next popup.
+    unpaintPanel() {
+        const { panel } = this;
+        if ( panel === null ) { return; }
+        this.panel = null;
+        this.color = '';
+        panel.removeAttribute(POPUP_PANEL_MARK);
+        for ( const name of POPUP_PANEL_PROPERTIES ) {
+            panel.style.removeProperty(name);
+        }
     }
 
     destroy() {
         const { browser } = this;
         if ( browser === null ) { return; }
+        this.unpaintPanel();
         this.browser = null;
         if ( this.observer !== null ) {
             try {
@@ -406,7 +523,11 @@ const BasiliskButton = class {
     constructor(action) {
         this.action = action;
         this.id = BASILISK_BUTTON_ID;
-        this.viewId = 'ublock0-panel';
+        this.viewId = BASILISK_VIEW_ID;
+        // Each window's panelview, and the popup each panelview shows.
+        // While shown, the panelview is in a panel's anonymous content,
+        // where getElementById() does not find it.
+        this.viewNodes = new WeakMap();
         this.views = new WeakMap();
     }
 
@@ -425,6 +546,7 @@ const BasiliskButton = class {
                 view.id = this.viewId;
                 view.setAttribute('flex', '1');
                 doc.getElementById('PanelUI-multiView').appendChild(view);
+                this.viewNodes.set(doc.defaultView, view);
             },
             // Rendered with the node given: looking it up from here would
             // build it again.
@@ -437,11 +559,23 @@ const BasiliskButton = class {
         });
     }
 
+    // A popup still shown goes first, with its panel.
     stop() {
         CustomizableUI.destroyWidget(this.id);
         for ( const win of this.action.ui.tracker.windows ) {
-            const view = win.document.getElementById(this.viewId);
-            if ( view !== null ) { view.remove(); }
+            const node = this.viewNodes.get(win);
+            if ( node === undefined ) { continue; }
+            this.viewNodes.delete(win);
+            const view = this.views.get(node);
+            if ( view !== undefined ) {
+                view.destroy();
+                this.views.delete(node);
+            }
+            const panel = panelOf(node);
+            if ( panel !== null && panel.state !== 'closed' && typeof panel.hidePopup === 'function' ) {
+                panel.hidePopup();
+            }
+            node.remove();
         }
     }
 
@@ -469,7 +603,14 @@ const BasiliskButton = class {
         if ( previous !== undefined ) { previous.destroy(); }
         this.views.set(view, new PopupView(view, url, ( ) => {
             CustomizableUI.hidePanelForNode(view);
-        }));
+        }, this.inMenuPanel(view)));
+    }
+
+    // The menu panel sizes its subviews (a popup there is fitted to its
+    // view, as with Firefox 52's); a popup elsewhere is as wide as it needs.
+    inMenuPanel(view) {
+        const panel = panelOf(view);
+        return panel !== null && panel.id === 'PanelUI-popup';
     }
 
     onViewHiding(event) {
@@ -547,7 +688,9 @@ const BrowserAction = class {
         this.host = CustomizableUI !== null
             ? new BasiliskButton(this)
             : new PaleMoonButton(this);
-        this.styleURI = `data:text/css;charset=utf-8,${encodeURIComponent(buttonStyleOf(this.host.id))}`;
+        this.styleURI = `data:text/css;charset=utf-8,${
+            encodeURIComponent(buttonStyleOf(this.host.id) + POPUP_PANEL_STYLE)
+        }`;
     }
 
     start() {
