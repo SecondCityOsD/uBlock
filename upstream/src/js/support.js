@@ -135,6 +135,30 @@ function addDetailsToReportURL(id, collapse = false) {
     dom.attr(elem, 'data-url', url);
 }
 
+// [uBlock-UXP] The port's issue tracker has no issue form: the issue's
+// body asks for what uBO's forms ask, the troubleshooting info below, and
+// for a filter issue the page's address (as picked in the form).
+function addDetailsToPortReportURL(id) {
+    const elem = qs$(`#${id}`);
+    const url = new URL(dom.attr(elem, 'data-url'));
+    const page = reportedPage !== null
+        ? [ `**Web page:** ${qs$('select[name="url"]').value}`, '' ]
+        : [];
+    url.searchParams.set('body', [
+        ...page,
+        '**What happens, and the steps to see it:**',
+        '',
+        '',
+        '**Does it happen with uBlock Origin in Firefox?** (yes / no / not checked)',
+        '',
+        '',
+        '**Troubleshooting information:**',
+        '',
+        configToMarkdown(true),
+    ].join('\n'));
+    dom.attr(elem, 'data-url', url);
+}
+
 function renderData(data, depth = 0) {
     const indent = ' '.repeat(depth);
     if ( Array.isArray(data) ) {
@@ -182,6 +206,8 @@ async function showSupportData() {
 
     addDetailsToReportURL('filterReport', true);
     addDetailsToReportURL('bugReport', true);
+    addDetailsToPortReportURL('uxpBugReport');
+    addDetailsToPortReportURL('uxpFilterReport');
 }
 
 /******************************************************************************/
@@ -284,6 +310,10 @@ uBlockDashboard.patchCodeMirrorEditor(cmEditor);
     });
 
     if ( reportedPage !== null ) {
+        // [uBlock-UXP]
+        dom.on('select[name="url"]', 'change', ( ) => {
+            addDetailsToPortReportURL('uxpFilterReport');
+        });
         if ( dom.body.dataset.shouldUpdateLists ) {
             dom.on('.supportEntry.shouldUpdate button', 'click', ev => {
                 if ( updateFilterLists() === false ) { return; }

@@ -1308,6 +1308,22 @@
     "message": "Could not filter properly at browser launch. Reload the page to ensure proper filtering.",
     "description": "A warning which will appear in the popup panel if needed"
   },
+  "uxpSupportH": {
+    "message": "uBlock Origin for Pale Moon and Basilisk",
+    "description": "[uBlock-UXP] Header of the port's section in Support pane"
+  },
+  "uxpSupportP1": {
+    "message": "This is a port of uBlock Origin to Pale Moon and Basilisk, maintained in the <span data-url=\"https://github.com/SecondCityOsD/uBlock\"><code>SecondCityOsD/uBlock</code> repository</span>, not by uBlock Origin's developers.",
+    "description": "[uBlock-UXP] First paragraph of the port's section in Support pane"
+  },
+  "uxpSupportP2": {
+    "message": "Before you report a problem in a section below, check whether it also happens with uBlock Origin in Firefox: it may be how uBlock Origin is meant to work, or a bug of uBlock Origin itself, and then the sections below are the right place. If it happens only with this port, report it on the <span data-url=\"https://github.com/SecondCityOsD/uBlock/issues\">port's issue tracker</span> instead. <u>Requires a GitHub account.</u>",
+    "description": "[uBlock-UXP] Second paragraph of the port's section in Support pane"
+  },
+  "uxpSupportFilterNote": {
+    "message": "Check first whether the issue also happens with uBlock Origin in Firefox. If it happens only with this Pale Moon and Basilisk port, report it on the <span data-url=\"https://github.com/SecondCityOsD/uBlock/issues\">port's issue tracker</span> instead.",
+    "description": "[uBlock-UXP] Note before reporting a filter issue in Support pane"
+  },
   "dummy": {
     "message": "This entry must be the last one",
     "description": "so we dont need to deal with comma for last entry"

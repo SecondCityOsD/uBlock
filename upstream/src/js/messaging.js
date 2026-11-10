@@ -59,6 +59,14 @@ import µb from './background.js';
 
 /******************************************************************************/
 
+// [uBlock-UXP] The fork's version, as the add-ons manager shows it
+// (manifest.uxp_version, written by the build), for the About pane and the
+// troubleshooting info. uBO's own logic keeps the upstream release's
+// (vAPI.app.version).
+const shownVersion = browser.runtime.getManifest().uxp_version || vAPI.app.version;
+
+/******************************************************************************/
+
 // https://github.com/uBlockOrigin/uBlock-issues/issues/710
 //   Listeners have a name and a "privileged" status.
 //   The nameless default handler is always deemed "privileged".
@@ -157,7 +165,7 @@ const onMessage = function(request, sender, callback) {
     case 'getAppData':
         response = {
             name: self.browser.runtime.getManifest().name,
-            version: vAPI.app.version,
+            version: shownVersion,
             canBenchmark: µb.hiddenSettings.benchmarkDatasetURL !== 'unset',
         };
         break;
@@ -1378,7 +1386,7 @@ const getSupportData = async function() {
     const browserInfo = await browser.runtime.getBrowserInfo();
 
     return {
-        [`${vAPI.app.name}`]: `${vAPI.app.version}`,
+        [`${vAPI.app.name}`]: `${shownVersion}`,
         [`${browserInfo.name}`]: `${browserInfo.version}`,
         'filterset (summary)': {
             network: staticNetFilteringEngine.getFilterCount(),

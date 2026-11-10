@@ -2871,12 +2871,16 @@ const runPages = async function() {
 
 /******************************************************************************/
 
+const PORT_REPOSITORY = 'https://github.com/SecondCityOsD/uBlock';
+
 // uBO's dashboard controls which took their event from `window.event`, a
 // global UXP lacks: the Filter lists pane's two settings (the change threw,
 // the setting never saved), and the dashboard holding back a page with
 // unsaved My filters edits (its beforeunload handler threw: the page went
 // without asking). The page is asked as the browser asks before closing a
 // tab (nsIContentViewer.permitUnload()), its prompt answered by the test.
+// Then the port's About and Support panes: the add-on's own version, links
+// to the port's repository, the note on where to report what.
 const runDashboard = async function() {
     const report = {};
     const startedAt = Date.now();
@@ -2961,6 +2965,37 @@ const runDashboard = async function() {
         editor.setValue(saved);
         await sleep(300);
         report.saved = ask();
+
+        // The port's own About and Support: its version, its links, where
+        // to report what.
+        const pageReady = (path, ready) => {
+            const pageTab = win.gBrowser.addTab(`${base}${path}`);
+            return waitFor(( ) => {
+                const doc = pageTab.linkedBrowser.contentDocument;
+                return doc && doc.readyState === 'complete' && ready(doc) ? { doc, pageTab } : null;
+            }, 30000, path);
+        };
+        const about = await pageReady('about.html',
+            doc => doc.getElementById('aboutNameVer').textContent !== '');
+        report.about = {
+            nameVer: about.doc.getElementById('aboutNameVer').textContent,
+            links: Array.from(about.doc.querySelectorAll(
+                '[data-i18n="aboutPrivacyPolicy"], [data-i18n="aboutChangelog"], [data-i18n="aboutCode"]'
+            ), a => a.href),
+        };
+        win.gBrowser.removeTab(about.pageTab);
+        const support = await pageReady('support.html',
+            doc => doc.getElementById('uxpBugReport').getAttribute('data-url').includes('body='));
+        const reportURL = new support.doc.defaultView.URL(
+            support.doc.getElementById('uxpBugReport').getAttribute('data-url')
+        );
+        report.support = {
+            noteShown: support.doc.querySelector('.uxp').getBoundingClientRect().height > 0 &&
+                support.doc.querySelector('[data-i18n="uxpSupportP2"]').textContent.includes('Firefox'),
+            reportTo: `${reportURL.origin}${reportURL.pathname}`,
+            reportHasVersion: reportURL.searchParams.get('body').includes(`uBlock Origin: ${addonData.version}`),
+        };
+        win.gBrowser.removeTab(support.pageTab);
     } catch (ex) {
         report.error = String(ex);
     }
@@ -2969,7 +3004,7 @@ const runDashboard = async function() {
     }
     report.errors = errorsSince(startedAt);
     const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
-    const { settings = {}, unsaved = {}, saved = {}, errors } = report;
+    const { settings = {}, unsaved = {}, saved = {}, about = {}, support = {}, errors } = report;
     const saves = id => settings[id] !== undefined &&
         settings[id].changed === true && settings[id].restored === true;
     const checks = {
@@ -2979,6 +3014,13 @@ const runDashboard = async function() {
             unsaved.leaveAllowed === false, unsaved),
         savedLeaves: pass(saved.paneSaysUnsaved === false && saved.prompted === '' &&
             saved.leaveAllowed === true, saved),
+        aboutVersion: pass(about.nameVer === `uBlock Origin ${addonData.version}`, about.nameVer),
+        aboutLinks: pass(Array.isArray(about.links) && about.links.length === 3 &&
+            about.links.every(href => href === PORT_REPOSITORY || href.startsWith(`${PORT_REPOSITORY}/`)),
+            about.links),
+        supportNote: pass(support.noteShown === true, support.noteShown),
+        supportReport: pass(support.reportTo === `${PORT_REPOSITORY}/issues/new` &&
+            support.reportHasVersion === true, support),
         noErrors: pass(errors.runtime.length === 0 && errors.ubo.length === 0, errors),
     };
     report.summary = {
@@ -2987,6 +3029,8 @@ const runDashboard = async function() {
         settings,
         unsaved,
         saved,
+        about,
+        support,
         error: report.error,
     };
     return report;

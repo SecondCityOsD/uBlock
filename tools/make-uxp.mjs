@@ -319,7 +319,7 @@ const addEngine = async des => {
 };
 
 // tools/make-firefox-meta.py
-const writeFirefoxMeta = (des, version) => {
+const writeFirefoxMeta = (des, version, emVersion) => {
     const file = path.join(des, 'manifest.json');
     const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
     // Upstream drops sidebar_action from stable (3-part) releases.
@@ -327,6 +327,9 @@ const writeFirefoxMeta = (des, version) => {
         delete manifest.sidebar_action;
     }
     manifest.version = version;
+    // The fork's version, as the add-ons manager shows it, for uBO's pages
+    // to show (About, troubleshooting info): `version` must stay upstream's.
+    manifest.uxp_version = emVersion;
     const upstreamAuthor = manifest.author;
     manifest.browser_specific_settings.gecko.id = ADDON_ID;
     manifest.author = AUTHOR;
@@ -570,7 +573,7 @@ const main = async ( ) => {
     const compat = rewriteForUXP(BUILD);
     // uBO's code as released doesn't use the engine's worker.
     const workerSize = options.pristine ? 0 : await addEngine(BUILD);
-    const { manifest, upstreamAuthor } = writeFirefoxMeta(BUILD, version);
+    const { manifest, upstreamAuthor } = writeFirefoxMeta(BUILD, version, emVersion);
     overlayPlatform(BUILD, options);
     writeInstallRdf(BUILD, manifest, upstreamAuthor, emVersion, options);
     writeChromeManifest(BUILD);

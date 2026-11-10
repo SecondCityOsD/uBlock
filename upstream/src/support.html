@@ -20,6 +20,19 @@
 <body>
 
 <div class="body">
+    <!-- [uBlock-UXP] Where to report what: uBlock Origin's own trackers
+         for what also happens in Firefox, the port's for the rest. -->
+    <div class="uxp">
+        <h3 data-i18n="uxpSupportH"></h3>
+        <div class="supportEntry">
+            <div>
+                <p data-i18n="uxpSupportP1">
+                <p data-i18n="uxpSupportP2">
+            </div>
+            <button id="uxpBugReport" type="button" data-url="https://github.com/SecondCityOsD/uBlock/issues/new" data-i18n="supportOpenButton">_<span class="hover"></span></button>
+        </div>
+        <hr>
+    </div>
     <div class="a">
         <h3 data-i18n="supportS1H"></h3>
         <div class="supportEntry">
@@ -65,6 +78,12 @@
     <div class="e">
         <h3 data-i18n="supportS6H"></h3>
         <p data-i18n="supportS3P1"></p>
+        <!-- [uBlock-UXP] -->
+        <div class="supportEntry">
+            <hr>
+            <p data-i18n="uxpSupportFilterNote"></p>
+            <button id="uxpFilterReport" type="button" data-url="https://github.com/SecondCityOsD/uBlock/issues/new" data-i18n="supportOpenButton">_<span class="hover"></span></button>
+        </div>
         <div class="supportEntry shouldUpdate">
             <hr>
             <p data-i18n="supportS6P2S1">_</p>
