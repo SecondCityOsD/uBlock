@@ -60,7 +60,9 @@ import zlib from 'node:zlib';
 // exactly as a dev build (vapi-common.js), which changes its behavior.
 const UXP_REVISION = 1;
 
-const CHROME_PACKAGE = 'ublock0';
+// Not legacy uBO's `ublock0`: both may be registered at once. bootstrap.js
+// loads the runtime from it.
+const CHROME_PACKAGE = 'ublock-uxp';
 
 const TARGET_APPLICATIONS = [
     {   // Pale Moon
@@ -76,9 +78,15 @@ const TARGET_APPLICATIONS = [
     },
 ];
 
+// The fork's own identity, not uBO's: legacy uBO 1.16 (uBlock0@raymondhill.net)
+// may be installed beside it, and each must stay its own add-on. uBO's
+// authors stay credited (em:contributor).
+const ADDON_ID = 'ublock@sinfulosd';
+const AUTHOR = 'SinfulOsD';
+
 // Releases are published on GitHub: the update manifest is served from the
 // release branch, each XPI is an asset of the GitHub release tagged with its
-// em:version. The legacy 1.16 fork's installs check the same manifest.
+// em:version.
 const REPOSITORY = 'SecondCityOsD/uBlock';
 const RELEASE_BRANCH = 'main';
 const HOMEPAGE_URL = `https://github.com/${REPOSITORY}`;
@@ -319,8 +327,11 @@ const writeFirefoxMeta = (des, version) => {
         delete manifest.sidebar_action;
     }
     manifest.version = version;
+    const upstreamAuthor = manifest.author;
+    manifest.browser_specific_settings.gecko.id = ADDON_ID;
+    manifest.author = AUTHOR;
     fs.writeFileSync(file, JSON.stringify(sortKeysDeep(manifest), null, 2) + '\n');
-    return manifest;
+    return { manifest, upstreamAuthor };
 };
 
 // tools/make-assets.sh
@@ -370,7 +381,7 @@ const overlayPlatform = (des, options) => {
     fs.copyFileSync(path.join(des, 'img', 'icon_64.png'), path.join(des, 'icon64.png'));
 };
 
-const writeInstallRdf = (des, manifest, emVersion, options) => {
+const writeInstallRdf = (des, manifest, upstreamAuthor, emVersion, options) => {
     const messages = JSON.parse(
         fs.readFileSync(path.join(des, '_locales', 'en', 'messages.json'), 'utf8')
     );
@@ -397,6 +408,7 @@ const writeInstallRdf = (des, manifest, emVersion, options) => {
         `    <em:name>${escapeXML(name)}</em:name>`,
         `    <em:description>${escapeXML(description)}</em:description>`,
         `    <em:creator>${escapeXML(manifest.author)}</em:creator>`,
+        `    <em:contributor>${escapeXML(`${upstreamAuthor} (uBlock Origin)`)}</em:contributor>`,
         `    <em:homepageURL>${HOMEPAGE_URL}</em:homepageURL>`,
         // Debug builds never update themselves: a test runs the build under
         // test, and only that.
@@ -558,9 +570,9 @@ const main = async ( ) => {
     const compat = rewriteForUXP(BUILD);
     // uBO's code as released doesn't use the engine's worker.
     const workerSize = options.pristine ? 0 : await addEngine(BUILD);
-    const manifest = writeFirefoxMeta(BUILD, version);
+    const { manifest, upstreamAuthor } = writeFirefoxMeta(BUILD, version);
     overlayPlatform(BUILD, options);
-    writeInstallRdf(BUILD, manifest, emVersion, options);
+    writeInstallRdf(BUILD, manifest, upstreamAuthor, emVersion, options);
     writeChromeManifest(BUILD);
 
     const names = listFiles(BUILD);

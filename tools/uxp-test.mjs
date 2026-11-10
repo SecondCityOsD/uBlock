@@ -40,6 +40,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 /******************************************************************************/
 
@@ -58,9 +59,34 @@ const BROWSERS = {
     },
 };
 
-const ADDON_ID = JSON.parse(
-    fs.readFileSync(path.join(ROOT, 'upstream', 'platform', 'firefox', 'manifest.json'), 'utf8')
-).browser_specific_settings.gecko.id;
+// The ID of the add-on in an XPI, read from its install.rdf (the first
+// em:id: the add-on's own, before its target applications'). The profile
+// takes the XPI under that name.
+const addonIdOf = function(xpi) {
+    const zip = fs.readFileSync(xpi);
+    const end = zip.lastIndexOf(Buffer.from([ 0x50, 0x4b, 0x05, 0x06 ]));
+    if ( end === -1 ) { throw new Error(`${xpi}: not a zip file`); }
+    let at = zip.readUInt32LE(end + 16);
+    for ( let i = zip.readUInt16LE(end + 10); i > 0; i-- ) {
+        const method = zip.readUInt16LE(at + 10);
+        const size = zip.readUInt32LE(at + 20);
+        const nameLength = zip.readUInt16LE(at + 28);
+        const local = zip.readUInt32LE(at + 42);
+        const name = zip.toString('utf8', at + 46, at + 46 + nameLength);
+        at += 46 + nameLength + zip.readUInt16LE(at + 30) + zip.readUInt16LE(at + 32);
+        if ( name !== 'install.rdf' ) { continue; }
+        const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+        const data = zip.subarray(start, start + size);
+        const rdf = (method === 0 ? data : zlib.inflateRawSync(data)).toString('utf8');
+        const match = /<em:id>([^<]+)<\/em:id>/.exec(rdf);
+        if ( match !== null ) { return match[1]; }
+    }
+    throw new Error(`${xpi}: no add-on ID in an install.rdf`);
+};
+
+// What the harness (platform/uxp/debug/harness.js) reads: under the
+// runtime's pref branch (NAME_PREFIX in Extension.jsm).
+const TEST_PREFS = 'extensions.ublock-uxp.uxpTest.';
 
 // Quiet, deterministic startup: no first-run pages, no update checks, no
 // prompts, sideloaded add-ons enabled without confirmation.
@@ -160,8 +186,8 @@ const updateScenarioPrefs = function(xpi) {
     }
     const hash = createHash('sha256').update(fs.readFileSync(release)).digest('hex');
     return {
-        'extensions.ublock0.uxpTest.updateManifest': manifest,
-        'extensions.ublock0.uxpTest.updateExpected': JSON.stringify({ version, file, hash: `sha256:${hash}` }),
+        [`${TEST_PREFS}updateManifest`]: manifest,
+        [`${TEST_PREFS}updateExpected`]: JSON.stringify({ version, file, hash: `sha256:${hash}` }),
     };
 };
 
@@ -182,12 +208,12 @@ const prepareProfile = function(key, xpi, options) {
     writeUserJS(profileDir, {
         ...BASE_PREFS,
         ...options.scenarioPrefs,
-        'extensions.ublock0.uxpTest.scenario': options.scenario,
-        'extensions.ublock0.uxpTest.autoQuit': true,
-        ...(options.script !== '' ? { 'extensions.ublock0.uxpTest.script': options.script } : {}),
+        [`${TEST_PREFS}scenario`]: options.scenario,
+        [`${TEST_PREFS}autoQuit`]: true,
+        ...(options.script !== '' ? { [`${TEST_PREFS}script`]: options.script } : {}),
         ...options.prefs,
     });
-    fs.copyFileSync(xpi, path.join(profileDir, 'extensions', `${ADDON_ID}.xpi`));
+    fs.copyFileSync(xpi, path.join(profileDir, 'extensions', `${addonIdOf(xpi)}.xpi`));
     return profileDir;
 };
 

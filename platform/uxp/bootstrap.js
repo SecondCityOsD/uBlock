@@ -28,7 +28,8 @@
 const { classes: Cc, interfaces: Ci, utils: Cu } = Components;
 const { Services } = Cu.import('resource://gre/modules/Services.jsm', {});
 
-const RUNTIME_URL = 'chrome://ublock0/content/uxp/Extension.jsm';
+// The add-on's chrome package: CHROME_PACKAGE in tools/make-uxp.mjs.
+const RUNTIME_URL = 'chrome://ublock-uxp/content/uxp/Extension.jsm';
 
 let extension = null;
 let harness = null;

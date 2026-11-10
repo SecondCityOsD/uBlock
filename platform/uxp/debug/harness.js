@@ -19,7 +19,7 @@
 */
 
 // Shipped only in debug builds (tools/make-uxp.mjs --debug). Driven by prefs
-// under extensions.ublock0.uxpTest., which tools/uxp-test.mjs writes into a
+// under extensions.ublock-uxp.uxpTest., which tools/uxp-test.mjs writes into a
 // throwaway profile:
 //   scenario  ''         mirror the console to <profile>/uxp-test/console.log
 //             'probe'    also probe the platform
@@ -65,14 +65,14 @@ const { setTimeout, clearTimeout } = Cu.import('resource://gre/modules/Timer.jsm
 
 Cu.importGlobalProperties([ 'indexedDB' ]);
 
-const prefs = Services.prefs.getBranch('extensions.ublock0.uxpTest.');
+const prefs = Services.prefs.getBranch('extensions.ublock-uxp.uxpTest.');
 const appShell = Cc['@mozilla.org/appshell/appShellService;1']
     .getService(Ci.nsIAppShellService);
 
 const SCENARIO_TIMEOUT = 240000;
-const PREF_MANAGED_STORAGE = 'extensions.ublock0.managedStorage';
+const PREF_MANAGED_STORAGE = 'extensions.ublock-uxp.managedStorage';
 // Module scripts report their resolved jar:file: URL, not the chrome:// one.
-const OWN_SOURCES = /^(?:chrome:\/\/ublock0\/|moz-extension:\/\/|resource:\/\/ublock0-probe\/|jar:file:.+\.xpi!\/)/;
+const OWN_SOURCES = /^(?:chrome:\/\/ublock-uxp\/|moz-extension:\/\/|resource:\/\/ublock-uxp-probe\/|jar:file:.+\.xpi!\/)/;
 
 let addonData = null;
 let outDir = null;
@@ -534,7 +534,7 @@ const createHost = function() {
         host = { browser, listener };
         webProgress.addProgressListener(listener, Ci.nsIWebProgress.NOTIFY_STATE_DOCUMENT);
         browser.document.location =
-            `data:application/vnd.mozilla.xul+xml;charset=utf-8,<window id='ublock0-probe'/>`;
+            `data:application/vnd.mozilla.xul+xml;charset=utf-8,<window id='ublock-uxp-probe'/>`;
     });
 };
 
@@ -612,7 +612,7 @@ const probePages = async function(report) {
     const results = [];
     let bgWindow = null;
     for ( const page of PAGES ) {
-        const result = await probePage(`chrome://ublock0/content/${page}`);
+        const result = await probePage(`chrome://ublock-uxp/content/${page}`);
         if ( page === 'background.html' && result.readyState !== 'none' ) {
             bgWindow = result.iframe.contentWindow;
         } else {
@@ -624,10 +624,10 @@ const probePages = async function(report) {
     // Same background page through other schemes, for the scheme decision.
     const resProtocol = Services.io.getProtocolHandler('resource')
         .QueryInterface(Ci.nsIResProtocolHandler);
-    resProtocol.setSubstitution('ublock0-probe', addonData.resourceURI);
-    const viaResource = await probePage('resource://ublock0-probe/background.html');
+    resProtocol.setSubstitution('ublock-uxp-probe', addonData.resourceURI);
+    const viaResource = await probePage('resource://ublock-uxp-probe/background.html');
     viaResource.iframe.remove();
-    resProtocol.setSubstitution('ublock0-probe', null);
+    resProtocol.setSubstitution('ublock-uxp-probe', null);
     results.push(pageResult(viaResource));
 
     if ( report.mozExtension.substituting ) {
@@ -653,7 +653,7 @@ const runProbes = async function() {
     await createHost();
     const pages = await probePages(report);
     const win = pages.bgWindow || appShell.hiddenDOMWindow;
-    report.probedIn = pages.bgWindow ? 'chrome://ublock0/content/background.html' : 'hiddenDOMWindow';
+    report.probedIn = pages.bgWindow ? 'chrome://ublock-uxp/content/background.html' : 'hiddenDOMWindow';
     report.environment = probeEnvironment(win);
     report.syntax = parseIn(win, SYNTAX_PROBES);
     report.builtins = evaluateIn(win, BUILTIN_PROBES);
@@ -1199,7 +1199,7 @@ const API_EXPECTED = {
     executeScriptAllFrames: 4,
     executeScriptFile: { value: [ false ] },
     sendMessageNoReceiver: { error: 'Could not establish connection. Receiving end does not exist.' },
-    sendMessage: { value: { echo: 42, senderId: 'uBlock0@raymondhill.net' } },
+    get sendMessage() { return { value: { echo: 42, senderId: addonData.id } }; },
     connect: { value: { echo: 7, name: 'uxp-test' } },
     insertCSS: 'none',
     removeCSS: 'block',
@@ -1416,10 +1416,10 @@ const UI_FILTERS = [ '||127.0.0.1^*/uxp-blocked/' ];
 
 // Basilisk's panelview for the popup (api-ui.js); while shown, it is in a
 // panelmultiview's anonymous content, which querySelector() does not search.
-const POPUP_VIEW_ID = 'PanelUI-webext-ublock0-button-view';
+const POPUP_VIEW_ID = 'PanelUI-webext-ublock-uxp-button-view';
 
 const findPopupBrowser = function(win) {
-    const selector = '.ublock0-popup-browser';
+    const selector = '.ublock-uxp-popup-browser';
     const view = win.document.getElementById(POPUP_VIEW_ID);
     return win.document.querySelector(selector) || view && view.querySelector(selector);
 };
@@ -1482,7 +1482,7 @@ const openContextMenu = async function(win, element) {
     await Promise.race([ shown, sleep(5000) ]);
     const labels = [];
     const items = [];
-    for ( const node of menu.querySelectorAll('[data-ublock0-menu] menuitem, menuitem[data-ublock0-menu], menu[data-ublock0-menu]') ) {
+    for ( const node of menu.querySelectorAll('[data-ublock-uxp-menu] menuitem, menuitem[data-ublock-uxp-menu], menu[data-ublock-uxp-menu]') ) {
         if ( node.localName === 'menu' ) { continue; }
         const parent = node.parentNode.parentNode;
         labels.push(parent.localName === 'menu'
@@ -1507,7 +1507,7 @@ const runUI = async function() {
 
         // Toolbar button and badge
         const button = await waitFor(
-            ( ) => win.document.querySelector('[id="uBlock0-legacy-button"], [id="ublock0-button"]'),
+            ( ) => win.document.querySelector('[id="ublock-uxp-button"]'),
             10000, 'the toolbar button'
         );
         const badge = await waitFor(( ) => button.getAttribute('badge'), 10000, 'the badge')
@@ -1517,7 +1517,7 @@ const runUI = async function() {
             parent: button.parentNode ? button.parentNode.id : null,
             label: button.getAttribute('label'),
             badge,
-            icon: button.style.getPropertyValue('--ublock0-icon'),
+            icon: button.style.getPropertyValue('--ublock-uxp-icon'),
         };
         report.badgeFromAPI = (await callBackground(bgWindow, 'browserAction.getBadgeText', { tabId })).value;
         const pageStore = µb.pageStoreFromTabId(tabId);
@@ -1603,7 +1603,7 @@ const runUI = async function() {
                 name: 'launch-logger',
                 shortcut: 'Alt+Shift+L',
             });
-            const key = win.document.querySelector('#ublock0-commands > key');
+            const key = win.document.querySelector('#ublock-uxp-commands > key');
             report.shortcutKey = key
                 ? `${key.getAttribute('modifiers')} ${key.getAttribute('key')}`
                 : 'none';
@@ -1622,7 +1622,7 @@ const runUI = async function() {
                 }
             }
             await callBackground(bgWindow, 'commands.reset', 'launch-logger');
-            report.shortcutAfterReset = win.document.getElementById('ublock0-commands') === null
+            report.shortcutAfterReset = win.document.getElementById('ublock-uxp-commands') === null
                 ? 'none'
                 : 'still there';
         });
@@ -1742,7 +1742,7 @@ const runPopup = async function() {
     if ( isBasilisk ) {
         ({ CustomizableUI: CUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {}));
     }
-    const buttonId = isBasilisk ? 'ublock0-button' : 'uBlock0-legacy-button';
+    const buttonId = 'ublock-uxp-button';
     const win = Services.wm.getMostRecentWindow('navigator:browser');
     const doc = win.document;
 
@@ -2150,7 +2150,7 @@ const runFiltering = async function() {
                 networkPredictionEnabled: await get('network.networkPredictionEnabled'),
                 hyperlinkAuditingEnabled: await get('websites.hyperlinkAuditingEnabled'),
             };
-            report.privacyStored = Object.keys(JSON.parse(readAnyPref('extensions.ublock0.privacySettings') || '{}'));
+            report.privacyStored = Object.keys(JSON.parse(readAnyPref('extensions.ublock-uxp.privacySettings') || '{}'));
             // A setting set, then cleared: its pref comes back to what it was.
             const referrers = 'websites.referrersEnabled';
             const pref = 'network.http.sendRefererHeader';
@@ -2341,20 +2341,20 @@ const leftovers = async function(addonId, uuid) {
     let buttonPlacement = null;
     try {
         const { CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {});
-        buttonPlacement = CustomizableUI.getPlacementOfWidget('ublock0-button', false, true);
+        buttonPlacement = CustomizableUI.getPlacementOfWidget('ublock-uxp-button', false, true);
     } catch {
         const doc = 'chrome://browser/content/browser.xul';
         const store = Cc['@mozilla.org/xul/xulstore;1'].getService(Ci.nsIXULStore);
         const ids = store.getIDsEnumerator(doc);
         while ( ids.hasMore() ) {
             const id = ids.getNext();
-            if ( store.getValue(doc, id, 'currentset').includes('uBlock0-legacy-button') ) {
+            if ( store.getValue(doc, id, 'currentset').includes('ublock-uxp-button') ) {
                 buttonPlacement = { toolbar: id };
             }
         }
     }
     return {
-        prefs: Services.prefs.getChildList('extensions.ublock0.', {})
+        prefs: Services.prefs.getChildList('extensions.ublock-uxp.', {})
             .filter(name => Services.prefs.prefHasUserValue(name))
             .sort(),
         originStorage,
@@ -2403,7 +2403,7 @@ const runUninstall = async function(disableFirst) {
     const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
     const { before = {}, after = {} } = report;
     checks.somethingToRemove = pass(
-        (before.prefs || []).includes('extensions.ublock0.uuid') &&
+        (before.prefs || []).includes('extensions.ublock-uxp.uuid') &&
         (before.originStorage || []).length !== 0 &&
         before.storageLocal === true && before.buttonPlacement !== null,
         before);
@@ -2412,14 +2412,14 @@ const runUninstall = async function(disableFirst) {
     if ( disableFirst ) {
         const disabled = report.afterDisable || {};
         checks.disableKeepsData = pass(
-            (disabled.prefs || []).includes('extensions.ublock0.uuid') &&
+            (disabled.prefs || []).includes('extensions.ublock-uxp.uuid') &&
             (disabled.originStorage || []).length !== 0 && disabled.storageLocal === true &&
             Array.isArray(disabled.privacyPrefsSet) && disabled.privacyPrefsSet.length === 0,
             disabled);
     }
     checks.addonRemoved = pass(report.addonGone === true, report.addonGone);
     checks.prefs = pass(
-        JSON.stringify(after.prefs) === JSON.stringify([ 'extensions.ublock0.managedStorage' ]),
+        JSON.stringify(after.prefs) === JSON.stringify([ 'extensions.ublock-uxp.managedStorage' ]),
         after.prefs);
     checks.originStorage = pass(Array.isArray(after.originStorage) && after.originStorage.length === 0, after.originStorage);
     checks.storageLocal = pass(after.storageLocal === false, after.storageLocal);
@@ -2524,7 +2524,7 @@ const STOP_FILTERS = [
 ];
 // Added by the stalls scenario while uBO reloads.
 const ADDED_FILTER = `||${STOP_HOST}^*/uxp-added/`;
-const RUNTIME_SOURCE = /^chrome:\/\/ublock0\/content\/uxp\/|\/bootstrap\.js$/;
+const RUNTIME_SOURCE = /^chrome:\/\/ublock-uxp\/content\/uxp\/|\/bootstrap\.js$/;
 const UBO_SOURCE = /^moz-extension:\/\//;
 
 const stopRoutes = function(path) {
@@ -3005,11 +3005,11 @@ const UPGRADE_MARK = 'uxpBeforeUpgrade';
 
 const openPopupOf = function(win) {
     if ( Services.appinfo.name !== 'Basilisk' ) {
-        win.document.getElementById('uBlock0-legacy-button').doCommand();
+        win.document.getElementById('ublock-uxp-button').doCommand();
         return;
     }
     const { CustomizableUI } = Cu.import('resource:///modules/CustomizableUI.jsm', {});
-    CustomizableUI.getWidget('ublock0-button').forWindow(win).node.dispatchEvent(
+    CustomizableUI.getWidget('ublock-uxp-button').forWindow(win).node.dispatchEvent(
         new win.CustomEvent('command', { bubbles: true, cancelable: true })
     );
 };
@@ -3089,12 +3089,12 @@ const upgradeStage2 = async function() {
         // a panel's anonymous content, which querySelectorAll() misses.
         await sleep(1000);
         report.parts = {
-            buttons: doc.querySelectorAll('[id="ublock0-button"], [id="uBlock0-legacy-button"]').length,
-            keysets: doc.querySelectorAll('[id="ublock0-commands"]').length,
+            buttons: doc.querySelectorAll('[id="ublock-uxp-button"]').length,
+            keysets: doc.querySelectorAll('[id="ublock-uxp-commands"]').length,
             views: doc.querySelectorAll(`[id="${POPUP_VIEW_ID}"]`).length,
-            popupBrowsers: doc.querySelectorAll('.ublock0-popup-browser').length +
+            popupBrowsers: doc.querySelectorAll('.ublock-uxp-popup-browser').length +
                 (doc.getElementById(POPUP_VIEW_ID)
-                    ? doc.getElementById(POPUP_VIEW_ID).querySelectorAll('.ublock0-popup-browser').length
+                    ? doc.getElementById(POPUP_VIEW_ID).querySelectorAll('.ublock-uxp-popup-browser').length
                     : 0),
         };
         report.blocking = await probeBlocking(win, server, 60000);

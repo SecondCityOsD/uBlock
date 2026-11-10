@@ -27,13 +27,16 @@
 // palette, and onto the toolbar whose persisted `currentset` names it (on
 // first run, the navigation bar); its popup opens in an arrow panel.
 // Basilisk has CustomizableUI: the button is a `view` widget whose panelview
-// hosts the popup, as with Firefox 52's own browserAction. The button IDs
-// are legacy uBO's, so the button stays where users of uBO 1.16 put it.
+// hosts the popup, as with Firefox 52's own browserAction. Every name given
+// to the browser's UI starts with NAME_PREFIX (Extension.jsm): legacy uBO
+// 1.16 may be installed beside the fork, with buttons, menus and keys of
+// its own.
 //
 // Loaded into Extension.jsm's global (see there).
 
 /* global Cc, Ci, Cu, Services, dispatch, windowUtilsOf, outerWindowIdOf, logMessage,
-          MatchPattern, EventManager, ExtensionError, apiSync, apiAsync */
+          MatchPattern, EventManager, ExtensionError, apiSync, apiAsync,
+          NAME_PREFIX, PREF_BRANCH */
 /* exported createUIAPIs, forgetBrowserUI */
 
 'use strict';
@@ -43,18 +46,20 @@ var { createUIAPIs, forgetBrowserUI } = (( ) => {
 const XUL_NS = 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul';
 const HTML_NS = 'http://www.w3.org/1999/xhtml';
 const BROWSER_URL = 'chrome://browser/content/browser.xul';
-const PALE_MOON_BUTTON_ID = 'uBlock0-legacy-button';
-const BASILISK_BUTTON_ID = 'ublock0-button';
+const BUTTON_ID = `${NAME_PREFIX}-button`;
 // The prefix is Firefox 52's for browserAction views: Basilisk's styles
 // give those views up to 800 pixels and no padding, 360 to other views.
-const BASILISK_VIEW_ID = `PanelUI-webext-${BASILISK_BUTTON_ID}-view`;
-const POPUP_PANEL_MARK = 'ublock0-popup';
-const PREF_BUTTON_PLACED = 'extensions.ublock0.toolbarButtonPlaced';
-const PREF_SHORTCUTS = 'extensions.ublock0.shortcuts';
+const BASILISK_VIEW_ID = `PanelUI-webext-${BUTTON_ID}-view`;
+const POPUP_PANEL_MARK = `${NAME_PREFIX}-popup`;
+const POPUP_BROWSER_CLASS = `${NAME_PREFIX}-popup-browser`;
+const PREF_BUTTON_PLACED = `${PREF_BRANCH}toolbarButtonPlaced`;
+const PREF_SHORTCUTS = `${PREF_BRANCH}shortcuts`;
 const POPUP_MAX_WIDTH = 800;
 const POPUP_MAX_HEIGHT = 600;
-const MENU_MARK = 'data-ublock0-menu';
-const KEYSET_ID = 'ublock0-commands';
+const MENU_MARK = `data-${NAME_PREFIX}-menu`;
+const KEYSET_ID = `${NAME_PREFIX}-commands`;
+// The CSS properties the runtime sets on its button and panel.
+const cssProperty = name => `--${NAME_PREFIX}-${name}`;
 const XPI_PROVIDER_URL = 'resource://gre/modules/addons/XPIProvider.jsm';
 const { AUTHOR_SHEET } = Ci.nsIDOMWindowUtils;
 const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
@@ -186,23 +191,23 @@ const arrowImageOf = function(color, vertical) {
 const POPUP_PANEL_STYLE = `
 panel[${POPUP_PANEL_MARK}] > .panel-arrowcontainer > .panel-arrowcontent {
     padding: 0 !important;
-    background: var(--ublock0-popup-background, -moz-field) !important;
+    background: var(${cssProperty('popup-background')}, -moz-field) !important;
 }
 panel[${POPUP_PANEL_MARK}] .panel-arrow[side="top"],
 panel[${POPUP_PANEL_MARK}] .panel-arrow[side="bottom"] {
-    list-style-image: var(--ublock0-popup-arrow-vertical,
+    list-style-image: var(${cssProperty('popup-arrow-vertical')},
         url("chrome://global/skin/arrow/panelarrow-vertical.svg")) !important;
 }
 panel[${POPUP_PANEL_MARK}] .panel-arrow[side="left"],
 panel[${POPUP_PANEL_MARK}] .panel-arrow[side="right"] {
-    list-style-image: var(--ublock0-popup-arrow-horizontal,
+    list-style-image: var(${cssProperty('popup-arrow-horizontal')},
         url("chrome://global/skin/arrow/panelarrow-horizontal.svg")) !important;
 }`;
 
 const POPUP_PANEL_PROPERTIES = [
-    '--ublock0-popup-background',
-    '--ublock0-popup-arrow-vertical',
-    '--ublock0-popup-arrow-horizontal',
+    cssProperty('popup-background'),
+    cssProperty('popup-arrow-vertical'),
+    cssProperty('popup-arrow-horizontal'),
 ];
 
 // A popup page in a content <browser>, sized to its content (at most 800 by
@@ -221,7 +226,7 @@ const PopupView = class {
             disablehistory: 'true',
             transparent: 'true',
             tooltip: 'aHTMLTooltip',
-            class: 'ublock0-popup-browser',
+            class: POPUP_BROWSER_CLASS,
             src: url,
         };
         for ( const [ name, value ] of Object.entries(attributes) ) {
@@ -387,7 +392,7 @@ PopupView.EVENTS = [ 'DOMWindowClose', 'DOMContentLoaded', 'load', 'MozScrolledA
 const PaleMoonButton = class {
     constructor(action) {
         this.action = action;
-        this.id = PALE_MOON_BUTTON_ID;
+        this.id = BUTTON_ID;
         this.panelId = `${this.id}-panel`;
         this.buttons = new WeakMap();
         this.views = new WeakMap();
@@ -522,7 +527,7 @@ const PaleMoonButton = class {
 const BasiliskButton = class {
     constructor(action) {
         this.action = action;
-        this.id = BASILISK_BUTTON_ID;
+        this.id = BUTTON_ID;
         this.viewId = BASILISK_VIEW_ID;
         // Each window's panelview, and the popup each panelview shows.
         // While shown, the panelview is in a panel's anonymous content,
@@ -643,20 +648,20 @@ const BasiliskButton = class {
 
 const buttonStyleOf = id => `
 #${id} {
-    list-style-image: var(--ublock0-icon) !important;
+    list-style-image: var(${cssProperty('icon')}) !important;
     -moz-image-region: auto !important;
 }
 #${id}[cui-areatype="menu-panel"],
 toolbarpaletteitem[place="palette"] > #${id} {
-    list-style-image: var(--ublock0-icon-large) !important;
+    list-style-image: var(${cssProperty('icon-large')}) !important;
 }
 toolbar #${id} > .toolbarbutton-badge-stack > .toolbarbutton-icon {
     width: 16px;
     height: 16px;
 }
 #${id} .toolbarbutton-badge {
-    background: var(--ublock0-badge-background) !important;
-    color: var(--ublock0-badge-color) !important;
+    background: var(${cssProperty('badge-background')}) !important;
+    color: var(${cssProperty('badge-color')}) !important;
 }
 #${id} .toolbarbutton-badge[value=""] {
     display: none !important;
@@ -739,10 +744,10 @@ const BrowserAction = class {
             node.setAttribute('disabled', 'true');
         }
         const { style } = node;
-        style.setProperty('--ublock0-icon', cssURL(iconURLFor(state.icons, 16, win)));
-        style.setProperty('--ublock0-icon-large', cssURL(iconURLFor(state.icons, 32, win)));
-        style.setProperty('--ublock0-badge-background', state.badgeBackgroundColor);
-        style.setProperty('--ublock0-badge-color', state.badgeTextColor);
+        style.setProperty(cssProperty('icon'), cssURL(iconURLFor(state.icons, 16, win)));
+        style.setProperty(cssProperty('icon-large'), cssURL(iconURLFor(state.icons, 32, win)));
+        style.setProperty(cssProperty('badge-background'), state.badgeBackgroundColor);
+        style.setProperty(cssProperty('badge-color'), state.badgeTextColor);
     }
 
     // A change for `tabId` shows where the tab is selected; a change of
@@ -1530,19 +1535,19 @@ const createUIAPIs = function(extension) {
 // with the runtime's other prefs: see Extension.uninstall().)
 const forgetBrowserUI = function() {
     if ( CustomizableUI !== null ) {
-        CustomizableUI.removeWidgetFromArea(BASILISK_BUTTON_ID);
+        CustomizableUI.removeWidgetFromArea(BUTTON_ID);
         return;
     }
     // Pale Moon: the button's ID out of the toolbars' `currentset`, as
     // persisted for the windows to come and in the open ones.
     const names = value => value.split(/\s*,\s*/);
-    const without = value => names(value).filter(id => id !== PALE_MOON_BUTTON_ID).join(',');
+    const without = value => names(value).filter(id => id !== BUTTON_ID).join(',');
     const store = Cc['@mozilla.org/xul/xulstore;1'].getService(Ci.nsIXULStore);
     const ids = store.getIDsEnumerator(BROWSER_URL);
     while ( ids.hasMore() ) {
         const id = ids.getNext();
         const currentset = store.getValue(BROWSER_URL, id, 'currentset');
-        if ( names(currentset).includes(PALE_MOON_BUTTON_ID) ) {
+        if ( names(currentset).includes(BUTTON_ID) ) {
             store.setValue(BROWSER_URL, id, 'currentset', without(currentset));
         }
     }
@@ -1550,7 +1555,7 @@ const forgetBrowserUI = function() {
     while ( windows.hasMoreElements() ) {
         for ( const toolbar of windows.getNext().document.querySelectorAll('toolbar[currentset]') ) {
             const currentset = toolbar.getAttribute('currentset');
-            if ( names(currentset).includes(PALE_MOON_BUTTON_ID) ) {
+            if ( names(currentset).includes(BUTTON_ID) ) {
                 toolbar.setAttribute('currentset', without(currentset));
             }
         }

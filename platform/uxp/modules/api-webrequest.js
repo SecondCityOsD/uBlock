@@ -42,14 +42,15 @@
 
 /* global Cc, Ci, Cr, Cu, Services, URL, XPCOMUtils, setTimeout,
           clearTimeout, dispatch, MatchPattern, outerWindowIdOf, errorNameOf,
-          EventManager, ExtensionError, PageValue, apiSync, apiAsync */
+          EventManager, ExtensionError, PageValue, apiSync, apiAsync, NAME_PREFIX */
 /* exported createWebRequestAPIs */
 
 'use strict';
 
 var { createWebRequestAPIs } = (( ) => {
 
-const REQUEST_ID_KEY = 'uBlock0-uxp.requestId';
+// The request ID each channel carries, in its property bag.
+const REQUEST_ID_KEY = `${NAME_PREFIX}.requestId`;
 const PRIMING_TIMEOUT_MS = 60000;
 const MODIFY_TOPIC = 'http-on-modify-request';
 const EXAMINE_TOPICS = [

@@ -23,7 +23,7 @@
 // Loaded into Extension.jsm's global (see there).
 
 /* global Ci, Cu, Services, setTimeout, clearTimeout, indexedDB, dispatch,
-          EventManager, ExtensionError, PageValue, apiSync, apiAsync */
+          EventManager, ExtensionError, PageValue, apiSync, apiAsync, PREF_BRANCH */
 /* exported createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE */
 
 'use strict';
@@ -32,7 +32,7 @@ var { createCoreAPIs, forgetCoreData, PREF_MANAGED_STORAGE } = (( ) => {
 
 // Firefox's managed storage (admin settings): JSON in this pref, the
 // admin's, which outlives the add-on.
-const PREF_MANAGED_STORAGE = 'extensions.ublock0.managedStorage';
+const PREF_MANAGED_STORAGE = `${PREF_BRANCH}managedStorage`;
 const NO_RECEIVER = 'Could not establish connection. Receiving end does not exist.';
 const NO_LATE_RESPONSE = 'Promised response from onMessage listener went out of scope';
 

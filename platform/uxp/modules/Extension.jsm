@@ -49,6 +49,15 @@ var { XPCOMUtils } = Cu.import('resource://gre/modules/XPCOMUtils.jsm', {});
 var { NetUtil } = Cu.import('resource://gre/modules/NetUtil.jsm', {});
 var { setTimeout, clearTimeout } = Cu.import('resource://gre/modules/Timer.jsm', {});
 
+// Every name the runtime gives the browser starts with this: prefs, element
+// IDs, CSS properties, contract IDs (the chrome package too: make-uxp.mjs).
+// Not legacy uBO's `ublock0`: 1.16 may be installed beside the fork, and its
+// uninstall deletes the whole `extensions.ublock0.` branch.
+var NAME_PREFIX = 'ublock-uxp';
+// The runtime's prefs, all under this branch, the admin's managed storage
+// (PREF_MANAGED_STORAGE, api-core.js) among them.
+var PREF_BRANCH = `extensions.${NAME_PREFIX}.`;
+
 Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
 
 {
@@ -69,9 +78,6 @@ Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
 
 /******************************************************************************/
 
-// The runtime's prefs, all under this branch, the admin's managed storage
-// (PREF_MANAGED_STORAGE, api-core.js) among them.
-const PREF_BRANCH = 'extensions.ublock0.';
 const PREF_UUID = `${PREF_BRANCH}uuid`;
 const XUL_NS = 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul';
 const RTL_LANGUAGES = new Set([ 'ar', 'ckb', 'dv', 'fa', 'he', 'ps', 'sd', 'ug', 'ur', 'yi' ]);
@@ -226,7 +232,7 @@ var outerWindowIdOf = function(win) {
 };
 
 var logMessage = message => {
-    Services.console.logStringMessage(`uBlock0 UXP: ${message}`);
+    Services.console.logStringMessage(`uBlock UXP: ${message}`);
 };
 
 /******************************************************************************/
@@ -367,7 +373,7 @@ const ExtensionProtocol = class {
         this.originalClassID = this.registrar.contractIDToCID(MOZ_EXTENSION_CONTRACT);
         this.registrar.registerFactory(
             this.classID,
-            'uBlock0 moz-extension protocol',
+            'uBlock UXP moz-extension protocol',
             MOZ_EXTENSION_CONTRACT,
             this
         );
@@ -507,7 +513,7 @@ const WebAccessiblePolicy = class {
         this.classID = Components.ID(Cc['@mozilla.org/uuid-generator;1']
             .getService(Ci.nsIUUIDGenerator)
             .generateUUID().toString());
-        this.contractID = '@ublock0.uxp/web-accessible-policy;1';
+        this.contractID = `@${NAME_PREFIX}/web-accessible-policy;1`;
         this.QueryInterface = XPCOMUtils.generateQI([ Ci.nsIContentPolicy, Ci.nsIFactory ]);
         // Gecko consults the policy for a moment after it is unregistered
         // (category changes reach the content policy service in a later
@@ -521,7 +527,7 @@ const WebAccessiblePolicy = class {
     register() {
         this.registrar.registerFactory(
             this.classID,
-            'uBlock0 web-accessible resources',
+            'uBlock UXP web-accessible resources',
             this.contractID,
             this
         );

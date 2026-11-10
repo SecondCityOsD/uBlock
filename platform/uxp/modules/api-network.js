@@ -25,14 +25,14 @@
 // Loaded into Extension.jsm's global (see there).
 
 /* global Cc, Ci, Cr, Cu, Services, XPCOMUtils, errorNameOf, EventManager,
-          ExtensionError, apiAsync */
+          ExtensionError, apiAsync, PREF_BRANCH */
 /* exported createNetworkAPIs */
 
 'use strict';
 
 var { createNetworkAPIs } = (( ) => {
 
-const PREF_PRIVACY_SETTINGS = 'extensions.ublock0.privacySettings';
+const PREF_PRIVACY_SETTINGS = `${PREF_BRANCH}privacySettings`;
 
 const hasOwn = (o, key) => Object.prototype.hasOwnProperty.call(o, key);
 
