@@ -48,7 +48,7 @@ import { i18n$ } from './i18n.js';
 import io from './assets.js';
 import logger from './logger.js';
 import lz4Codec from './lz4.js';
-import publicSuffixList from '../lib/publicsuffixlist/publicsuffixlist.js';
+import publicSuffixList from './publicsuffix.js';
 import punycode from '../lib/punycode.js';
 import { redirectEngine } from './redirect-engine.js';
 import scriptletFilteringEngine from './scriptlet-filtering.js';
@@ -180,10 +180,8 @@ const onMessage = function(request, sender, callback) {
 
     case 'getWhitelist':
         response = {
-            whitelist: µb.arrayFromWhitelist(µb.netWhitelist),
-            whitelistDefault: µb.netWhitelistDefault,
-            reBadHostname: µb.reWhitelistBadHostname.source,
-            reHostnameExtractor: µb.reWhitelistHostnameExtractor.source
+            whitelist: µb.trustedSites.toLines(),
+            whitelistDefault: µb.defaultTrustedSiteDirectives,
         };
         break;
 
@@ -224,7 +222,7 @@ const onMessage = function(request, sender, callback) {
         break;
     }
     case 'setWhitelist':
-        µb.netWhitelist = µb.whitelistFromString(request.whitelist);
+        µb.trustedSites.fromText(request.whitelist);
         µb.saveWhitelist();
         filteringBehaviorChanged();
         break;
@@ -367,7 +365,7 @@ const popupDataFromTabId = function(tabId, tabTitle) {
         globalBlockedRequestCount: µb.requestStats.blockedCount,
         fontSize: µbhs.popupFontSize,
         godMode: µbhs.filterAuthorMode,
-        netFilteringSwitch: false,
+        isTrustedSite: true,
         userFiltersAreEnabled: µb.userFiltersAreEnabled(),
         rawURL: tabContext.rawURL,
         pageURL: tabContext.normalURL,
@@ -392,7 +390,7 @@ const popupDataFromTabId = function(tabId, tabTitle) {
     const pageStore = µb.pageStoreFromTabId(tabId);
     if ( pageStore ) {
         r.pageCounts = pageStore.counts;
-        r.netFilteringSwitch = pageStore.getNetFilteringSwitch();
+        r.isTrustedSite = pageStore.isTrusted();
         getHostnameDict(pageStore.getAllHostnameDetails(), r);
         r.contentLastModified = pageStore.contentLastModified;
         getFirewallRules(rootHostname, r);
@@ -619,14 +617,10 @@ const onMessage = function(request, sender, callback) {
         response = popupDataFromTabId(request.tabId);
         break;
 
-    case 'toggleNetFiltering': {
+    case 'toggleTrustedStatus': {
         const pageStore = µb.pageStoreFromTabId(request.tabId);
         if ( pageStore ) {
-            pageStore.toggleNetFilteringSwitch(
-                request.url,
-                request.scope,
-                request.state
-            );
+            pageStore.toggleTrustedStatus(request.url, request.scope, request.state);
             µb.updateToolbarIcon(request.tabId, 0b111);
         }
         break;
@@ -663,9 +657,7 @@ const retrieveContentScriptParameters = async function(sender, request) {
     if ( tabId === undefined || frameId === undefined ) { return; }
 
     const pageStore = µb.pageStoreFromTabId(tabId);
-    if ( pageStore === null || pageStore.getNetFilteringSwitch() === false ) {
-        return;
-    }
+    if ( pageStore === null || pageStore.isTrusted() ) { return; }
 
     // A content script may not always be able to successfully look up the
     // effective context, hence in such case we try again to look up here
@@ -713,24 +705,15 @@ const retrieveContentScriptParameters = async function(sender, request) {
         });
     }
 
-    // https://github.com/uBlockOrigin/uBlock-issues/issues/688#issuecomment-748179731
-    //   For non-network URIs, scriptlet injection is deferred to here. The
-    //   effective URL is available here in `request.url`.
-    if ( logger.enabled ) {
-        const scriptletDetails = scriptletFilteringEngine.retrieve(request);
-        if ( scriptletDetails !== undefined ) {
-            scriptletFilteringEngine.toLogger(request, scriptletDetails);
-        }
-    }
-    if ( request.needScriptlets ) {
-        scriptletFilteringEngine.injectNow(request);
-    }
-
     // https://github.com/NanoMeow/QuickReports/issues/6#issuecomment-414516623
     //   Inject as early as possible to make the cosmetic logger code less
     //   sensitive to the removal of DOM nodes which may match injected
     //   cosmetic filters.
     if ( logger.enabled ) {
+        const filters = scriptletFilteringEngine.retrieve(request);
+        if ( filters ) {
+            scriptletFilteringEngine.toLogger(request, filters);
+        }
         if (
             noSpecificCosmeticFiltering === false ||
             noGenericCosmeticFiltering === false
@@ -783,11 +766,10 @@ const onMessage = function(request, sender, callback) {
             netSelectorCacheCountMax:
                 cosmeticFilteringEngine.netSelectorCacheCountMax,
         };
-        if (
-            µb.userSettings.collapseBlocked &&
-            pageStore && pageStore.getNetFilteringSwitch()
-        ) {
-            pageStore.getBlockedResources(request, response);
+        if ( µb.userSettings.collapseBlocked ) {
+            if ( pageStore && pageStore.isNotTrusted() ) {
+                pageStore.getBlockedResources(request, response);
+            }
         }
         break;
 
@@ -813,7 +795,7 @@ const onMessage = function(request, sender, callback) {
             break;
         }
         const fctxt = µb.filteringContext.fromTabId(sender.tabId);
-        if ( pageStore.filterScripting(fctxt, undefined) ) {
+        if ( pageStore.filterScripting(fctxt) ) {
             vAPI.tabs.executeScript(sender.tabId, {
                 file: '/js/scriptlets/noscript-spoof.js',
                 frameId: sender.frameId,
@@ -855,6 +837,8 @@ vAPI.messaging.listen({
 {
 // >>>>> start of local scope
 
+const epickerPassword = self.crypto.randomUUID();
+
 const onMessage = function(request, sender, callback) {
     // Async
     switch ( request.what ) {
@@ -887,6 +871,9 @@ const onMessage = function(request, sender, callback) {
     let response;
 
     switch ( request.what ) {
+    case 'elementPickerPassword':
+        response = epickerPassword;
+        break;
     case 'elementPickerEprom':
         µb.epickerArgs.eprom = request;
         break;
@@ -1037,11 +1024,11 @@ const backupUserData = async function() {
         selectedFilterLists: µb.selectedFilterLists,
         hiddenSettings:
             µb.getModifiedSettings(µb.hiddenSettings, µb.hiddenSettingsDefault),
-        whitelist: µb.arrayFromWhitelist(µb.netWhitelist),
+        whitelist: µb.trustedSites.toLines(),
         dynamicFilteringString: permanentFirewall.toString(),
         urlFilteringString: permanentURLFiltering.toString(),
         hostnameSwitchesString: permanentSwitches.toString(),
-        userFilters: userFilters.content,
+        userFilters: userFilters.content.split('\n'),
     };
 
     const filename = i18n$('aboutBackupFilename')
@@ -1129,7 +1116,10 @@ const restoreUserData = async function(request) {
         lastBackupFile: '',
         lastBackupTime: 0
     });
-    µb.saveUserFilters(userData.userFilters);
+    const userFilters = Array.isArray(userData.userFilters)
+        ? userData.userFilters.join('\n')
+        : userData.userFilters;
+    µb.saveUserFilters(userFilters);
     if ( Array.isArray(userData.selectedFilterLists) ) {
         await µb.saveSelectedFilterLists(userData.selectedFilterLists);
     }
@@ -1222,7 +1212,7 @@ const getRules = function() {
                 sessionSwitches.toArray(),
                 sessionURLFiltering.toArray()
             ),
-        pslSelfie: publicSuffixList.toSelfie(),
+        pslSelfie: publicSuffixList.toSelfie?.(),
     };
 };
 
@@ -1401,8 +1391,8 @@ const getSupportData = async function() {
         },
         'filterset (user)': filterset,
         trustedset: diffArrays(
-            µb.arrayFromWhitelist(µb.netWhitelist),
-            µb.netWhitelistDefault
+            µb.trustedSites.toLines(),
+            µb.defaultTrustedSiteDirectives
         ),
         switchRuleset: diffArrays(
             sessionSwitches.toArray(),
@@ -2017,7 +2007,7 @@ const logCSPViolations = function(pageStore, request) {
 
         fctxt.type = 'script';
         fctxt.filter = undefined;
-        if ( pageStore.filterScripting(fctxt, true) === 1 ) {
+        if ( pageStore.filterScripting(fctxt, false) === 1 ) {
             cspData.set(µb.hiddenSettings.noScriptingCSP, fctxt.filter);
         }
     
