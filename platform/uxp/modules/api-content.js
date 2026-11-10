@@ -83,6 +83,14 @@ const checkRunAt = function(runAt) {
     return runAt;
 };
 
+// A script's world: its isolated content-script sandbox, or the page's own
+// global (`MAIN`, Firefox 128).
+const checkWorld = function(world) {
+    if ( world === undefined || world === 'ISOLATED' ) { return 'ISOLATED'; }
+    if ( world === 'MAIN' ) { return 'MAIN'; }
+    throw new ExtensionError(`Invalid world: ${world}`);
+};
+
 const checkCSSOrigin = function(cssOrigin) {
     if ( cssOrigin === undefined || cssOrigin === 'author' ) { return AUTHOR_SHEET; }
     if ( cssOrigin === 'user' ) { return USER_SHEET; }
@@ -112,24 +120,28 @@ const nextTask = ( ) => new Promise(resolve => { dispatch(resolve); });
 
 // The URLs a document is matched by: its own, or with matchAboutBlank, for
 // about:blank and about:srcdoc, its principal's -- the URL of the document
-// which created it. System and expanded principals have none.
+// which created it. With matchOriginAsFallback (Firefox 128), blob: frames
+// too are matched by their principal's; data: frames, whose principals are
+// opaque, are not. System and expanded principals have no URL.
 const documentURLsOf = function(doc) {
     const spec = doc.documentURI;
-    if ( /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(spec) === false ) {
-        return { url: parseURL(spec), aboutBlankURL: null };
-    }
-    let principalURI = null;
-    try {
-        principalURI = doc.nodePrincipal.URI;
-    } catch {
+    const isAboutBlank = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(spec);
+    let originURL = null;
+    if ( isAboutBlank || spec.startsWith('blob:') ) {
+        try {
+            originURL = parseURL(doc.nodePrincipal.URI.spec);
+        } catch {
+        }
     }
     return {
-        url: null,
-        aboutBlankURL: principalURI ? parseURL(principalURI.spec) : null,
+        url: isAboutBlank ? null : parseURL(spec),
+        aboutBlankURL: isAboutBlank ? originURL : null,
+        originURL,
     };
 };
 
-const urlToMatch = function(urls, matchAboutBlank) {
+const urlToMatch = function(urls, matchAboutBlank, matchOriginAsFallback = false) {
+    if ( matchOriginAsFallback && urls.originURL !== null ) { return urls.originURL; }
     if ( urls.url !== null ) { return urls.url; }
     return matchAboutBlank ? urls.aboutBlankURL : null;
 };
@@ -219,12 +231,14 @@ const ContentScript = class {
         this.css = (details.css || []).map(entry => sources.resolve(entry, baseURL));
         this.allFrames = details.allFrames === true;
         this.matchAboutBlank = details.matchAboutBlank === true;
+        this.matchOriginAsFallback = details.matchOriginAsFallback === true;
         this.runAt = checkRunAt(details.runAt);
+        this.world = checkWorld(details.world);
     }
 
     appliesTo(urls, isTop) {
         if ( isTop === false && this.allFrames === false ) { return false; }
-        const url = urlToMatch(urls, this.matchAboutBlank);
+        const url = urlToMatch(urls, this.matchAboutBlank, this.matchOriginAsFallback);
         if ( url === null || this.matches.matchesURL(url) === false ) { return false; }
         if ( this.excludeMatches.matchesURL(url) ) { return false; }
         const { href } = url;
@@ -271,6 +285,9 @@ const ContentContext = class extends Context {
         });
         super(extension, window, 'content_script', sandbox);
         this.sandbox = sandbox;
+        // MAIN-world scripts where the page's CSP rules out an inline
+        // <script>, made when first needed (see evaluateInPage()).
+        this.mainSandbox = null;
         this.document = doc;
         this.sheets = [];
         this.waiting = [];
@@ -286,6 +303,49 @@ const ContentContext = class extends Context {
 
     evaluate(text, filename) {
         return Cu.evalInSandbox(text, this.sandbox, 'latest', filename, 1);
+    }
+
+    // A script of the MAIN world, in the page's own global (Firefox runs
+    // those there whatever the page's CSP; UXP gives chrome code no way to,
+    // no evalInWindow nor compileScript, and the subscript loader takes
+    // local URLs only). An inline <script> runs it there exactly as the
+    // page's own code: the page's builtins, `globalThis` the window. Where
+    // that can't run (a page with a CSP, which may forbid inline scripts and
+    // would report the attempt; a document not HTML), a sandbox of the
+    // page's principal without Xrays: the page's window and DOM, but the
+    // sandbox's own builtins and `globalThis`.
+    evaluateInPage(text, filename) {
+        const doc = this.document;
+        let csp = null;
+        try {
+            csp = doc.nodePrincipal.csp;
+        } catch {
+        }
+        if ( csp === null && doc.documentElement !== null ) {
+            const page = Cu.waiveXrays(this.window);
+            const sentinel = `uxp-main-world-${Math.random().toString(36).slice(2)}`;
+            const script = doc.createElementNS('http://www.w3.org/1999/xhtml', 'script');
+            script.textContent = `window[${JSON.stringify(sentinel)}] = true;\n${text}`;
+            (doc.head || doc.documentElement).appendChild(script);
+            script.remove();
+            if ( page[sentinel] === true ) {
+                delete page[sentinel];
+                return;
+            }
+        }
+        if ( this.mainSandbox === null ) {
+            this.mainSandbox = Cu.Sandbox(this.window, {
+                sandboxName: `${this.extension.id} content script (page)`,
+                metadata: {
+                    'inner-window-id': this.innerWindowID,
+                    addonId: this.extension.id,
+                },
+                sandboxPrototype: this.window,
+                sameZoneAs: this.window,
+                wantXrays: false,
+            });
+        }
+        Cu.evalInSandbox(text, this.mainSandbox, 'latest', filename, 1);
     }
 
     reached(runAt) {
@@ -380,6 +440,10 @@ const ContentContext = class extends Context {
             }
         }
         Cu.nukeSandbox(sandbox);
+        if ( this.mainSandbox !== null ) {
+            Cu.nukeSandbox(this.mainSandbox);
+            this.mainSandbox = null;
+        }
     }
 };
 
@@ -509,7 +573,12 @@ const ContentScripts = class {
             for ( const source of script.js ) {
                 if ( context.unloaded ) { return; }
                 try {
-                    context.evaluate(this.sources.textOf(source), source.url);
+                    const text = this.sources.textOf(source);
+                    if ( script.world === 'MAIN' ) {
+                        context.evaluateInPage(text, source.url);
+                    } else {
+                        context.evaluate(text, source.url);
+                    }
                 } catch (ex) {
                     Cu.reportError(ex);
                 }

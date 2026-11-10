@@ -19,8 +19,8 @@
 */
 
 // Lints the code written here, platform/uxp/ and tools/, and uBO's code,
-// upstream/src/js/, which our changes go into (PLAN.md, "Changes to uBO's
-// code"), all with upstream uBO's own rules (upstream/eslint.config.mjs).
+// upstream/src/js/, which our changes go into (each marked [uBlock-UXP]),
+// all with upstream uBO's own rules (upstream/eslint.config.mjs).
 // The rest of upstream/ is uBO's to lint.
 //
 // Usage: npm run lint
@@ -131,7 +131,9 @@ export default [
         },
     },
     // uBO's code: modules of its pages, with upstream's globals (and the
-    // WebExtension ones its code names, `browser` and `chrome`).
+    // WebExtension ones its code names, `browser` and `chrome`). Since 1.76
+    // some of its modules declare `browser` (`/* global browser */`), others
+    // still don't: a declaration of a known global is no error.
     {
         files: [ 'upstream/src/js/**/*.js' ],
         languageOptions: {
@@ -141,6 +143,9 @@ export default [
                 ...globals.webextensions,
                 vAPI: 'readonly',
             },
+        },
+        rules: {
+            'no-redeclare': [ 'error', { builtinGlobals: false } ],
         },
     },
     // Build and test tools, run by Node.

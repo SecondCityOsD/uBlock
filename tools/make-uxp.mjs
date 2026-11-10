@@ -20,7 +20,7 @@
 
 // Assembles dist/uBlock0_<version>.uxp.xpi from:
 //   upstream/      uBlock Origin's release tree, with our changes to its code
-//                  marked [uBlock-UXP] (PLAN.md, "Changes to uBO's code")
+//                  marked [uBlock-UXP] (see PRISTINE_COMMIT)
 //   platform/uxp/  the WebExtension runtime for UXP, and the worker that
 //                  builds uBO's network filtering engine (engine/)
 //
@@ -34,7 +34,9 @@
 // js/uxp-engine-worker.js.
 //
 // A release build also writes dist/update.rdf, the update manifest that
-// offers it (PLAN.md, "Releasing").
+// offers it: committed at the repository's root, it is what installs check
+// (em:updateURL), the XPI being the asset of the GitHub release tagged with
+// its em:version.
 //
 // Usage: node tools/make-uxp.mjs [--debug] [--no-assets] [--refresh-assets]
 //            [--pristine]
@@ -55,10 +57,12 @@ import zlib from 'node:zlib';
 
 /******************************************************************************/
 
-// em:version is <upstream version>.<UXP_REVISION>. manifest.json keeps the
-// plain upstream version: uBO treats any version not matching \d+.\d+.\d+
-// exactly as a dev build (vapi-common.js), which changes its behavior.
-const UXP_REVISION = 1;
+// em:version is the upstream version, then .<UXP_REVISION> for the port's
+// own releases of that upstream version: 1.76.0, 1.76.0.1, 1.76.0.2...
+// (0 for a new upstream version). manifest.json keeps the plain upstream
+// version: uBO treats any version not matching \d+.\d+.\d+ exactly as a dev
+// build (vapi-common.js), which changes its behavior.
+const UXP_REVISION = 0;
 
 // Not legacy uBO's `ublock0`: both may be registered at once. bootstrap.js
 // loads the runtime from it.
@@ -122,9 +126,11 @@ const BUILD = path.join(DIST, 'build', 'uBlock0.uxp');
 const ASSETS_CACHE = path.join(DIST, 'uAssets-cache');
 
 // The commit that imported upstream/ as uBO released it. Our changes to its
-// code came after, each marked [uBlock-UXP]; a new release of uBO is
-// imported over this commit and merged (PLAN.md, "Changes to uBO's code").
-const PRISTINE_COMMIT = 'b9cd483d45bae69176f1477b1ce5ff67a3bdefbc';
+// code came after, each marked [uBlock-UXP]. A new release of uBO is
+// imported over this commit, on a branch of its own (upstream/ replaced by
+// `git -c core.autocrlf=false archive` of the release's tag, without its
+// submodules), merged, and becomes the new PRISTINE_COMMIT.
+const PRISTINE_COMMIT = 'c18511d5299cfcf1b7ad081a10e2550a87dec873';
 const CHANGE_MARK = '[uBlock-UXP]';
 
 /******************************************************************************/
@@ -251,16 +257,27 @@ const rewriteForUXP = des => {
 const ENGINE_WORKER = 'js/uxp-engine-worker.js';
 const ENGINE_CLIENT = 'js/uxp-engine.js';
 
-// The modules the worker's modules import that it can't have, and what
-// stands in for each in the bundle (exports of worker-env.js): those of
-// uBO's background page, and the built-in scriptlets, which
-// redirect-engine.js imports with import(), which UXP's workers can't even
-// parse.
+// The modules the worker's modules import that it can't have, and the
+// module standing in for each in the bundle (paths relative to the
+// package's root): exports of worker-env.js for those of uBO's background
+// page, and for the built-in scriptlets, which redirect-engine.js imports
+// with import(), which UXP's workers can't even parse; and in place of the
+// modules with a top-level await, which a classic script can't have, what
+// the worker uses of them.
 const WORKER_STAND_INS = new Map([
-    [ 'js/background.js', 'export { µb as default }' ],
-    [ 'js/broadcast.js', 'export { onBroadcast }' ],
-    [ 'js/logger.js', 'export { logger as default }' ],
-    [ 'js/resources/scriptlets.js', 'export { builtinScriptlets }' ],
+    [ 'js/background.js', `export { µb as default } from './worker-env.js';` ],
+    [ 'js/broadcast.js', `export { onBroadcast } from './worker-env.js';` ],
+    [ 'js/logger.js', `export { logger as default } from './worker-env.js';` ],
+    [ 'js/resources/scriptlets.js', `export { builtinScriptlets } from './worker-env.js';` ],
+    // 1.76: awaits the import of uBO's own list where the browser has no
+    // publicSuffix API, as UXP has none.
+    [ 'js/publicsuffix.js', `export { default } from './lib/publicsuffixlist/publicsuffixlist.js';` ],
+    // 1.76: awaits the fetch of its injection templates; the worker only
+    // compiles filters, which the core engine does.
+    [ 'js/scriptlet-filtering.js', [
+        `import { ScriptletFilteringEngine } from './js/scriptlet-filtering-core.js';`,
+        'export default new ScriptletFilteringEngine();',
+    ].join('\n') ],
 ]);
 
 const standInsPlugin = des => ({
@@ -277,7 +294,7 @@ const standInsPlugin = des => ({
             return { path: rel, namespace: 'uxp-stand-in' };
         });
         bundler.onLoad({ filter: /.*/, namespace: 'uxp-stand-in' }, args => ({
-            contents: `${WORKER_STAND_INS.get(args.path)} from './worker-env.js';\n`,
+            contents: `${WORKER_STAND_INS.get(args.path)}\n`,
             resolveDir: des,
             loader: 'js',
         }));
@@ -562,7 +579,7 @@ const main = async ( ) => {
 
     const upstream = options.pristine ? pristineUpstream() : UPSTREAM;
     const version = fs.readFileSync(path.join(upstream, 'dist', 'version'), 'utf8').trim();
-    const emVersion = `${version}.${UXP_REVISION}`;
+    const emVersion = UXP_REVISION === 0 ? version : `${version}.${UXP_REVISION}`;
 
     fs.rmSync(BUILD, { recursive: true, force: true });
     fs.mkdirSync(BUILD, { recursive: true });

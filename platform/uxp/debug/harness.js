@@ -1111,11 +1111,14 @@ const COSMETIC_FILTERS = [
 
 const cosmeticRoutes = function(path) {
     // Every document records what its first script sees of the scriptlet.
-    const html = (title, body) => ({
+    // With a nonce, the document has a CSP allowing only scripts with it:
+    // the scriptlet's MAIN world can't be an inline <script> there.
+    const html = (title, body, nonce = '') => ({
         type: 'text/html; charset=utf-8',
+        headers: nonce !== '' ? [ `Content-Security-Policy: script-src 'nonce-${nonce}'` ] : [],
         body: `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
 <style>.uxp-ad, .uxp-generic-ad, .uxp-proc, .uxp-ok { display: block !important; }</style>
-<script>document.documentElement.dataset.scriptlet = String(window.uxpScriptletValue);</script>
+<script${nonce !== '' ? ` nonce="${nonce}"` : ''}>document.documentElement.dataset.scriptlet = String(window.uxpScriptletValue);</script>
 </head><body>${body}</body></html>`,
     });
     const ad = '<div id="specific" class="uxp-ad">ad</div>';
@@ -1127,6 +1130,7 @@ ${ad}
 <div id="procedural" class="uxp-proc">sponsored</div>
 <div id="procOk" class="uxp-proc">article</div>
 <iframe id="frame" src="/cosmetic-frame.html"></iframe>
+<iframe id="cspFrame" src="/cosmetic-csp-frame.html"></iframe>
 <iframe id="blankWritten"></iframe>
 <iframe id="blankDOM"></iframe>
 <script>
@@ -1146,6 +1150,8 @@ ${ad}
 </script>`);
     case '/cosmetic-frame.html':
         return html('uxp-cosmetic-frame', `<div id="ok" class="uxp-ok">ok</div>${ad}`);
+    case '/cosmetic-csp-frame.html':
+        return html('uxp-cosmetic-csp-frame', '<div id="ok" class="uxp-ok">ok</div>', 'uxp');
     default:
         return null;
     }
@@ -1161,6 +1167,7 @@ const COSMETIC_EXPECTED = {
         scriptlet: 'true',
     },
     frame: { ok: 'shown', specific: 'hidden', scriptlet: 'true' },
+    cspFrame: { scriptlet: 'true' },
     aboutBlankWritten: { specific: 'hidden' },
     aboutBlankDOM: { specific: 'hidden' },
 };
@@ -1176,6 +1183,7 @@ const cosmeticState = function(doc) {
         return frame ? frame.contentDocument : null;
     };
     const frame = frameDoc('frame');
+    const cspFrame = frameDoc('cspFrame');
     return {
         page: {
             ok: display(doc, 'ok'),
@@ -1192,6 +1200,11 @@ const cosmeticState = function(doc) {
                 ? frame.documentElement.dataset.scriptlet
                 : 'missing',
         },
+        cspFrame: {
+            scriptlet: cspFrame && cspFrame.documentElement
+                ? cspFrame.documentElement.dataset.scriptlet
+                : 'missing',
+        },
         aboutBlankWritten: { specific: display(frameDoc('blankWritten'), 'specific') },
         aboutBlankDOM: { specific: display(frameDoc('blankDOM'), 'specific') },
     };
@@ -1199,7 +1212,8 @@ const cosmeticState = function(doc) {
 
 const API_EXPECTED = {
     executeScriptCode: { value: [ 'uxp-cosmetic' ] },
-    executeScriptAllFrames: 4,
+    // The page, its frame, its CSP frame, its two about:blank frames.
+    executeScriptAllFrames: 5,
     executeScriptFile: { value: [ false ] },
     sendMessageNoReceiver: { error: 'Could not establish connection. Receiving end does not exist.' },
     get sendMessage() { return { value: { echo: 42, senderId: addonData.id } }; },

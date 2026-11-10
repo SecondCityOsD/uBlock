@@ -51,8 +51,8 @@ let fastCache = 'indexedDB';
 // derive again: compiled lists and selfies. When IndexedDB is the fast
 // cache, they go there as they are and nowhere else: their serialized
 // copy for storage.local, made in JavaScript on the main thread, froze the
-// browser for seconds (a compiled urlhaus weighs 73 MB; PLAN.md, Phase 6e
-// findings). If IndexedDB loses them, uBO compiles and builds again.
+// browser for seconds (a compiled urlhaus weighs 73 MB). If IndexedDB
+// loses them, uBO compiles and builds again.
 const fastCacheOnly = key => /^cache\/(compiled|selfie)\//.test(key);
 
 // The keys of `rawbin` IndexedDB took and holds alone; none if it failed

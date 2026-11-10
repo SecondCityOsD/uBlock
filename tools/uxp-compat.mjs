@@ -20,9 +20,10 @@
 
 // Rewrites applied to the package's copy of upstream's code (upstream/
 // itself stays as published), for constructs UXP's JavaScript engine runs
-// far slower than Firefox's (PLAN.md, Phase 6d findings). A rewrite keeps
-// the code's behavior exactly, and applies only where the source alone
-// shows that; any other occurrence is left as it is, and reported.
+// far slower than Firefox's (a call through `super`, some 1000 times). A
+// rewrite keeps the code's behavior exactly, and applies only where the
+// source alone shows that; any other occurrence is left as it is, and
+// reported.
 //
 // - A call through `super`, `super.name(args)` in a class method, runs
 //   about 1000 times slower than the same call made by name. It becomes

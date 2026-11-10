@@ -19,8 +19,9 @@
 */
 
 // UXP has no extension process: whatever uBO's background page computes
-// blocks the browser (PLAN.md, Phase 6d findings). This worker does uBO's
-// heaviest work off the main thread, with uBO's own code:
+// blocks the browser (compiling lists and building its engines froze it for
+// seconds at a time). This worker does uBO's heaviest work off the main
+// thread, with uBO's own code:
 // - it compiles filter lists, with µb.compileFilters()'s loop
 //   (static-filtering-compiler.js), and answers with the compiled list;
 // - it builds the network filtering engine from compiled lists, and
