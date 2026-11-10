@@ -35,7 +35,7 @@
 /* global URL, Context, EventManager, PageValue, injectAPI, createCoreAPIs,
           forgetCoreData, PREF_MANAGED_STORAGE, createTabsAPIs,
           createWebRequestAPIs, createContentAPIs, createUIAPIs,
-          forgetBrowserUI, createNetworkAPIs */
+          forgetBrowserUI, createNetworkAPIs, createOtherBlockersNotice */
 /* exported EXPORTED_SYMBOLS, Extension */
 
 'use strict';
@@ -70,6 +70,7 @@ Cu.importGlobalProperties([ 'URL', 'indexedDB' ]);
         'api-content.js',
         'api-ui.js',
         'api-network.js',
+        'other-blockers.js',
     ];
     for ( const script of scripts ) {
         Services.scriptloader.loadSubScript(`${base}${script}`, this, 'UTF-8');
@@ -750,6 +751,8 @@ var Extension = class {
         const ui = createUIAPIs(this);
         const network = createNetworkAPIs(this);
         this.apiModules = [ this.coreAPIs, tabs, webRequest, content, ui, network ];
+        // Other ad blockers enabled beside the port: offers to disable them.
+        createOtherBlockersNotice(this);
         Services.obs.addObserver(this, 'document-element-inserted', false);
         Services.obs.addObserver(this, 'inner-window-destroyed', false);
         Services.console.registerListener(this.consoleListener);

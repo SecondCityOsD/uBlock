@@ -88,6 +88,14 @@ const addonIdOf = function(xpi) {
 // runtime's pref branch (NAME_PREFIX in Extension.jsm).
 const TEST_PREFS = 'extensions.ublock-uxp.uxpTest.';
 
+// The `legacy` scenario installs legacy uBO 1.16.6.1 beside the build under
+// test (UXP_LEGACY_XPI, else the builds folder next to the repository), with
+// the add-on manager's compatibility check off, as its users run it on Pale
+// Moon: 1.16.6.1 declares Pale Moon up to 33 only.
+const LEGACY_XPI = process.env.UXP_LEGACY_XPI ||
+    path.join(ROOT, '..', 'uBlock-UXP builds', 'uBlock0_1.16.6.1.firefox-legacy.xpi');
+const LEGACY_PREFS = { 'extensions.enableCompatibilityChecking': false };
+
 // Quiet, deterministic startup: no first-run pages, no update checks, no
 // prompts, sideloaded add-ons enabled without confirmation.
 const BASE_PREFS = {
@@ -213,7 +221,9 @@ const prepareProfile = function(key, xpi, options) {
         ...(options.script !== '' ? { [`${TEST_PREFS}script`]: options.script } : {}),
         ...options.prefs,
     });
-    fs.copyFileSync(xpi, path.join(profileDir, 'extensions', `${addonIdOf(xpi)}.xpi`));
+    for ( const file of [ xpi, ...options.otherXPIs ] ) {
+        fs.copyFileSync(file, path.join(profileDir, 'extensions', `${addonIdOf(file)}.xpi`));
+    }
     return profileDir;
 };
 
@@ -368,6 +378,14 @@ const main = async ( ) => {
     const options = parseArgs();
     const xpi = options.xpi || latestDebugXPI();
     options.scenarioPrefs = options.scenario === 'update' ? updateScenarioPrefs(xpi) : {};
+    options.otherXPIs = [];
+    if ( options.scenario === 'legacy' ) {
+        if ( fs.existsSync(LEGACY_XPI) === false ) {
+            throw new Error(`no legacy uBO XPI at ${LEGACY_XPI} -- set UXP_LEGACY_XPI`);
+        }
+        options.otherXPIs.push(LEGACY_XPI);
+        Object.assign(options.scenarioPrefs, LEGACY_PREFS);
+    }
     const keys = options.browser === 'all' ? Object.keys(BROWSERS) : [ options.browser ];
     for ( const key of keys ) {
         if ( BROWSERS[key] === undefined ) { throw new Error(`unknown browser: ${key}`); }

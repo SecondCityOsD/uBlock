@@ -72,7 +72,9 @@ const appShell = Cc['@mozilla.org/appshell/appShellService;1']
 const SCENARIO_TIMEOUT = 240000;
 const PREF_MANAGED_STORAGE = 'extensions.ublock-uxp.managedStorage';
 // Module scripts report their resolved jar:file: URL, not the chrome:// one.
-const OWN_SOURCES = /^(?:chrome:\/\/ublock-uxp\/|moz-extension:\/\/|resource:\/\/ublock-uxp-probe\/|jar:file:.+\.xpi!\/)/;
+// Our add-on's code, not that of another add-on installed beside it (legacy
+// uBO, in the `legacy` scenario).
+const OWN_SOURCES = /^(?:chrome:\/\/ublock-uxp\/|moz-extension:\/\/|resource:\/\/ublock-uxp-probe\/|jar:file:.+\/ublock@sinfulosd\.xpi!\/)/;
 
 let addonData = null;
 let outDir = null;
@@ -122,9 +124,10 @@ const readDefaultPref = function(name) {
     return null;
 };
 
+// `name`: a path in outDir, its parts separated by `/`.
 const writeText = function(name, text, append = false) {
     const file = outDir.clone();
-    file.append(name);
+    for ( const part of name.split('/') ) { file.append(part); }
     const stream = Cc['@mozilla.org/network/file-output-stream;1']
         .createInstance(Ci.nsIFileOutputStream);
     // PR_WRONLY | PR_CREATE_FILE | (PR_APPEND or PR_TRUNCATE)
@@ -2524,7 +2527,7 @@ const STOP_FILTERS = [
 ];
 // Added by the stalls scenario while uBO reloads.
 const ADDED_FILTER = `||${STOP_HOST}^*/uxp-added/`;
-const RUNTIME_SOURCE = /^chrome:\/\/ublock-uxp\/content\/uxp\/|\/bootstrap\.js$/;
+const RUNTIME_SOURCE = /^chrome:\/\/ublock-uxp\/content\/uxp\/|\/ublock@sinfulosd\.xpi!\/bootstrap\.js$/;
 const UBO_SOURCE = /^moz-extension:\/\//;
 
 const stopRoutes = function(path) {
@@ -3038,6 +3041,230 @@ const runDashboard = async function() {
 
 /******************************************************************************/
 
+// Other ad blockers beside the port: legacy uBO 1.16.6.1, installed by
+// tools/uxp-test.mjs as when someone switches, and a stand-in the test
+// installs, a temporary add-on named "Test Ad Blocker" (found by its name).
+// Each runs beside the port, with its own button; the port's notice names
+// the other blocker, its buttons disable it, or keep it (not asked about
+// again); several blockers are named in one notice, disabled together.
+// Legacy uBO's uninstall, which deletes its whole pref branch, leaves the
+// port's prefs (its UUID: its data) as they were, and the port still blocks.
+const LEGACY_ID = 'uBlock0@raymondhill.net';
+const STAND_IN_ID = 'test-ad-blocker@uxp-test';
+const OTHER_BLOCKERS_NOTICE = 'ublock-uxp-other-blockers';
+
+// A restartless add-on with nothing in it but its name.
+const installStandInBlocker = function(AddonManager) {
+    const targets = [
+        '{8de7fcbb-c55c-4fbe-bfc5-fc555c87dbc4}',   // Pale Moon
+        '{ec8030f7-c20a-464f-9b0e-13a3a9e97384}',   // Basilisk
+    ].map(id => '<em:targetApplication><Description>' +
+        `<em:id>${id}</em:id><em:minVersion>1.0</em:minVersion><em:maxVersion>*</em:maxVersion>` +
+        '</Description></em:targetApplication>'
+    ).join('');
+    const dir = outDir.clone();
+    dir.append('test-ad-blocker');
+    if ( dir.exists() ) { dir.remove(true); }
+    dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+    writeText('test-ad-blocker/install.rdf', '<?xml version="1.0"?>' +
+        '<RDF xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:em="http://www.mozilla.org/2004/em-rdf#">' +
+        '<Description about="urn:mozilla:install-manifest">' +
+        `<em:id>${STAND_IN_ID}</em:id><em:version>1.0</em:version><em:type>2</em:type>` +
+        `<em:name>Test Ad Blocker</em:name><em:bootstrap>true</em:bootstrap>${targets}` +
+        '</Description></RDF>');
+    writeText('test-ad-blocker/bootstrap.js',
+        'function install() {}\nfunction uninstall() {}\nfunction startup() {}\nfunction shutdown() {}\n');
+    // UXP has no temporary installs: zipped, installed as any XPI is.
+    const xpi = outDir.clone();
+    xpi.append('test-ad-blocker.xpi');
+    const zip = Cc['@mozilla.org/zipwriter;1'].createInstance(Ci.nsIZipWriter);
+    zip.open(xpi, 0x04 | 0x08 | 0x20);   // PR_RDWR | PR_CREATE_FILE | PR_TRUNCATE
+    for ( const name of [ 'install.rdf', 'bootstrap.js' ] ) {
+        const file = dir.clone();
+        file.append(name);
+        zip.addEntryFile(name, Ci.nsIZipWriter.COMPRESSION_DEFAULT, file, false);
+    }
+    zip.close();
+    return new Promise((resolve, reject) => {
+        AddonManager.getInstallForFile(xpi, install => {
+            install.addListener({
+                onInstallEnded: ( ) => { resolve(); },
+                onInstallFailed: ( ) => { reject(new Error(`stand-in install failed: ${install.error}`)); },
+            });
+            install.install();
+        });
+    });
+};
+
+const runLegacy = async function() {
+    const report = {};
+    const startedAt = Date.now();
+    const server = new TestServer(stopRoutes);
+    server.start();
+    try {
+        const { AddonManager } = Cu.import('resource://gre/modules/AddonManager.jsm', {});
+        const addonOf = id => new Promise(resolve => { AddonManager.getAddonByID(id, resolve); });
+        const until = async (test, timeout) => {
+            const deadline = Date.now() + timeout;
+            for (;;) {
+                if ( await test() ) { return true; }
+                if ( Date.now() > deadline ) { return false; }
+                await sleep(250);
+            }
+        };
+        const isActive = async (id, want) => {
+            const addon = await addonOf(id);
+            return addon !== null && addon.isActive === want;
+        };
+        const setEnabled = async (id, enabled) => {
+            (await addonOf(id)).userDisabled = enabled === false;
+            await until(( ) => isActive(id, enabled), 10000);
+        };
+        await whenUBOReady();
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        const doc = win.document;
+        const box = doc.getElementById('global-notificationbox') || win.gBrowser.getNotificationBox();
+        const notice = ( ) => box.getNotificationWithValue(OTHER_BLOCKERS_NOTICE);
+        const buttonsOf = shown => Array.from(shown.querySelectorAll('button'),
+            b => b.label || b.getAttribute('label')).filter(Boolean);
+        const clickNotice = label => {
+            Array.from(notice().querySelectorAll('button'))
+                .find(b => (b.label || b.getAttribute('label')) === label)
+                .click();
+        };
+        const ourPrefs = ( ) => Services.prefs.getChildList('extensions.ublock-uxp.', {}).sort();
+        const addonState = addon => addon === null
+            ? 'removed'
+            : `${addon.version} ${addon.isActive ? 'active' : 'inactive'}`;
+        const state = async ( ) => {
+            const shown = notice();
+            return {
+                legacy: addonState(await addonOf(LEGACY_ID)),
+                standIn: addonState(await addonOf(STAND_IN_ID)),
+                notice: shown === null ? null : shown.label,
+                buttons: shown === null ? [] : buttonsOf(shown),
+                ourButton: doc.getElementById('ublock-uxp-button') !== null,
+                legacyButton: doc.querySelector('[id="uBlock0-legacy-button"], [id="ublock0-button"]') !== null,
+            };
+        };
+
+        // Legacy uBO beside the port, at launch.
+        await until(( ) => notice() !== null, 30000);
+        report.together = await state();
+        report.together.legacyPrefs = Services.prefs.getChildList('extensions.ublock0.', {}).length;
+        report.noticeScreenshot = notice() === null ? null : saveScreenshot(win, win, {
+            left: 0, top: win.innerHeight - 160, width: Math.min(win.innerWidth, 1400), height: 160,
+        }, 'other-blockers-notice.png');
+
+        // Its "Disable" button.
+        clickNotice('Disable uBlock Origin 1.16.6.1');
+        await until(( ) => isActive(LEGACY_ID, false), 10000);
+        await sleep(500);
+        report.disabled = await state();
+
+        // Enabled again: asked again.
+        await setEnabled(LEGACY_ID, true);
+        await until(( ) => notice() !== null, 10000);
+        report.reenabled = await state();
+
+        // "Keep both enabled": not asked about again.
+        clickNotice('Keep both enabled');
+        await until(( ) => notice() === null, 5000);
+        await setEnabled(LEGACY_ID, false);
+        await setEnabled(LEGACY_ID, true);
+        await sleep(2000);
+        report.kept = await state();
+        report.kept.pref = readAnyPref('extensions.ublock-uxp.otherBlockersKept');
+
+        // Another ad blocker, found by its name: named alone, legacy uBO kept.
+        await installStandInBlocker(AddonManager);
+        await until(( ) => notice() !== null, 10000);
+        report.standIn = await state();
+
+        // Nothing kept any more: both named in one notice, disabled together.
+        Services.prefs.clearUserPref('extensions.ublock-uxp.otherBlockersKept');
+        await setEnabled(STAND_IN_ID, false);
+        await setEnabled(STAND_IN_ID, true);
+        await until(( ) => notice() !== null && notice().label.includes('Test Ad Blocker') &&
+            notice().label.includes('1.16.6.1'), 10000);
+        report.several = await state();
+        clickNotice('Disable them');
+        await until(async ( ) => await isActive(LEGACY_ID, false) && await isActive(STAND_IN_ID, false), 10000);
+        await sleep(500);
+        report.severalDisabled = await state();
+
+        // Legacy uBO uninstalled: its cleanup deletes extensions.ublock0.*.
+        (await addonOf(STAND_IN_ID)).uninstall();
+        const prefsBefore = ourPrefs();
+        const uuidBefore = readAnyPref('extensions.ublock-uxp.uuid');
+        (await addonOf(LEGACY_ID)).uninstall();
+        await until(async ( ) => await addonOf(LEGACY_ID) === null, 10000);
+        await sleep(1000);
+        report.uninstalled = await state();
+        Object.assign(report.uninstalled, {
+            legacyPrefsLeft: Services.prefs.getChildList('extensions.ublock0.', {}),
+            ourPrefsKept: JSON.stringify(ourPrefs()) === JSON.stringify(prefsBefore),
+            uuidKept: uuidBefore !== '' && readAnyPref('extensions.ublock-uxp.uuid') === uuidBefore,
+            blocking: await probeBlocking(win, server, 60000),
+        });
+    } catch (ex) {
+        report.error = `${ex}\n${ex && ex.stack}`;
+    }
+    server.stop();
+    const errors = errorsSince(startedAt);
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const {
+        together = {}, disabled = {}, reenabled = {}, kept = {},
+        standIn = {}, several = {}, severalDisabled = {}, uninstalled = {},
+    } = report;
+    const legacy = '1.16.6.1';
+    const named = (s, ...names) => typeof s.notice === 'string' && names.every(n => s.notice.includes(n));
+    const checks = {
+        bothRun: pass(together.legacy === `${legacy} active` && together.legacyPrefs > 0 &&
+            together.ourButton === true && together.legacyButton === true, together),
+        noticeNamesIt: pass(named(together, `uBlock Origin ${legacy}`, 'uBlock Origin for Pale Moon and Basilisk') &&
+            JSON.stringify(together.buttons) === JSON.stringify([ `Disable uBlock Origin ${legacy}`, 'Keep both enabled' ]),
+        together),
+        disableDisables: pass(disabled.legacy === `${legacy} inactive` && disabled.notice === null &&
+            disabled.legacyButton === false && disabled.ourButton === true, disabled),
+        askedAgainWhenEnabled: pass(reenabled.legacy === `${legacy} active` && reenabled.notice !== null,
+            reenabled),
+        keepRemembered: pass(typeof kept.pref === 'string' && kept.pref.includes(LEGACY_ID) &&
+            kept.notice === null && kept.legacy === `${legacy} active`, kept),
+        anyBlockerByName: pass(standIn.standIn === '1.0 active' && named(standIn, 'Test Ad Blocker 1.0') &&
+            standIn.notice.includes(legacy) === false, standIn),
+        severalInOne: pass(named(several, 'Test Ad Blocker 1.0', `uBlock Origin ${legacy}`) &&
+            JSON.stringify(several.buttons) === JSON.stringify([ 'Disable them', 'Keep all enabled' ]), several),
+        severalDisabled: pass(severalDisabled.legacy === `${legacy} inactive` &&
+            severalDisabled.standIn === '1.0 inactive' && severalDisabled.notice === null, severalDisabled),
+        legacyCleanupRan: pass(uninstalled.legacy === 'removed' &&
+            Array.isArray(uninstalled.legacyPrefsLeft) && uninstalled.legacyPrefsLeft.length === 0,
+        uninstalled.legacyPrefsLeft),
+        oursKept: pass(uninstalled.ourPrefsKept === true && uninstalled.uuidKept === true &&
+            uninstalled.ourButton === true, uninstalled),
+        stillBlocks: pass(uninstalled.blocking !== undefined && uninstalled.blocking.blocked === true,
+            uninstalled.blocking),
+        noErrors: pass(errors.runtime.length === 0 && errors.ubo.length === 0, errors),
+    };
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        together,
+        disabled,
+        reenabled,
+        kept,
+        standIn,
+        several,
+        severalDisabled,
+        uninstalled,
+        noticeScreenshot: report.noticeScreenshot,
+        error: report.error,
+    };
+    return report;
+};
+
+/******************************************************************************/
+
 // Upgrade: the add-on installed again over itself while it runs, as an
 // update installs (ADDON_UPGRADE), with a dashboard tab open and the popup
 // used before. The instance that comes back runs the second stage: uBO
@@ -3128,10 +3355,17 @@ const upgradeStage2 = async function() {
         report.popup = await popupLoaded(win).then(( ) => 'loaded', ex => String(ex));
         const browser = findPopupBrowser(win);
         const panel = browser && panelOf(browser);
-        if ( panel && typeof panel.hidePopup === 'function' ) { panel.hidePopup(); }
+        if ( panel && typeof panel.hidePopup === 'function' ) {
+            // A panel still opening ignores hidePopup() (seen on a busy
+            // machine): closed once open.
+            await waitFor(( ) => panel.state === 'open', 5000, 'the panel open').catch(( ) => {});
+            panel.hidePopup();
+        }
         // Counted with the popup closed: shown, Basilisk's panelview is in
         // a panel's anonymous content, which querySelectorAll() misses.
-        await sleep(1000);
+        await waitFor(( ) => (!panel || panel.state === 'closed') && findPopupBrowser(win) === null,
+            5000, 'the popup closed').catch(( ) => {});
+        await sleep(500);
         report.parts = {
             buttons: doc.querySelectorAll('[id="ublock-uxp-button"]').length,
             keysets: doc.querySelectorAll('[id="ublock-uxp-commands"]').length,
@@ -3686,6 +3920,7 @@ const scenarios = {
     'stop-busy': runStopBusy,
     pages: runPages,
     dashboard: runDashboard,
+    legacy: runLegacy,
     upgrade: runUpgrade,
     stalls: runStalls,
     compile: runCompile,
@@ -3699,6 +3934,7 @@ const SCENARIO_FILTERS = {
     filtering: FILTERING_FILTERS,
     'stop-busy': STOP_FILTERS,
     upgrade: STOP_FILTERS,
+    legacy: STOP_FILTERS,
     // Its pages opened while uBO reloads (testPage()).
     stalls: STOP_FILTERS,
 };
@@ -3715,6 +3951,7 @@ const SCENARIO_HOSTS = {
     filtering: FILTERING_HOST,
     'stop-busy': STOP_HOST,
     upgrade: STOP_HOST,
+    legacy: STOP_HOST,
     stalls: STOP_HOST,
 };
 

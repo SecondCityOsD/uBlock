@@ -1324,6 +1324,30 @@
     "message": "Check first whether the issue also happens with uBlock Origin in Firefox. If it happens only with this Pale Moon and Basilisk port, report it on the <span data-url=\"https://github.com/SecondCityOsD/uBlock/issues\">port's issue tracker</span> instead.",
     "description": "[uBlock-UXP] Note before reporting a filter issue in Support pane"
   },
+  "uxpOtherBlockerNotice": {
+    "message": "Another ad blocker is enabled beside uBlock Origin for Pale Moon and Basilisk: $1. Two ad blockers filter every page twice, and together they can break websites.",
+    "description": "[uBlock-UXP] Browser notice when another ad blocker is enabled beside the port. $1: its name and version, e.g. 'uBlock Origin 1.16.6.1'"
+  },
+  "uxpOtherBlockersNotice": {
+    "message": "Other ad blockers are enabled beside uBlock Origin for Pale Moon and Basilisk: $1. Several ad blockers filter every page several times, and together they can break websites.",
+    "description": "[uBlock-UXP] Browser notice when several other ad blockers are enabled beside the port. $1: their names and versions, comma-separated"
+  },
+  "uxpOtherBlockerDisable": {
+    "message": "Disable $1",
+    "description": "[uBlock-UXP] Button of the notice: disables the other ad blocker. $1: its name and version"
+  },
+  "uxpOtherBlockersDisable": {
+    "message": "Disable them",
+    "description": "[uBlock-UXP] Button of the notice: disables the other ad blockers it names"
+  },
+  "uxpOtherBlockerKeep": {
+    "message": "Keep both enabled",
+    "description": "[uBlock-UXP] Button of the notice: keeps the other ad blocker enabled; the notice won't show again for it"
+  },
+  "uxpOtherBlockersKeep": {
+    "message": "Keep all enabled",
+    "description": "[uBlock-UXP] Button of the notice: keeps the other ad blockers enabled; the notice won't show again for them"
+  },
   "dummy": {
     "message": "This entry must be the last one",
     "description": "so we dont need to deal with comma for last entry"
