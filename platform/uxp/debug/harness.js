@@ -157,7 +157,7 @@ const readBytes = function(filePath) {
 
 const record = function(kind, text, source = '', keep = true) {
     if ( keep ) {
-        consoleLines.push({ kind, text, source });
+        consoleLines.push({ kind, text, source, time: Date.now() });
     }
     const time = new Date().toISOString().slice(11, 23);
     const where = source !== '' ? ` @ ${source}` : '';
@@ -2580,16 +2580,20 @@ xhr.send();`)}</script>
     }
 };
 
-// Errors logged since `since` by the runtime, and by uBO's own pages.
+// Errors logged since `since` by the runtime, and by uBO's own pages. Read
+// from the harness's record, not from the console service: that one drops
+// a window's messages once the window is destroyed, so the error of a page
+// that went away (a pane uBO blanked, a tab closed) would be missed.
 const errorsSince = function(since) {
     const out = { runtime: [], ubo: [] };
-    for ( const m of Services.console.getMessageArray() || [] ) {
-        if ( m instanceof Ci.nsIScriptError === false ) { continue; }
-        if ( m.timeStamp < since || (m.flags & Ci.nsIScriptError.warningFlag) !== 0 ) { continue; }
-        const text = `+${m.timeStamp - since} ms ${m.errorMessage} @ ${m.sourceName}:${m.lineNumber}`;
-        if ( RUNTIME_SOURCE.test(m.sourceName) ) {
+    for ( const line of consoleLines ) {
+        if ( line.time < since ) { continue; }
+        if ( line.kind !== 'error' && line.kind !== 'console.error' ) { continue; }
+        const file = line.source.replace(/(?::\d+)+$/, '');
+        const text = `+${line.time - since} ms ${line.text} @ ${line.source}`;
+        if ( RUNTIME_SOURCE.test(file) ) {
             out.runtime.push(text);
-        } else if ( UBO_SOURCE.test(m.sourceName) ) {
+        } else if ( UBO_SOURCE.test(file) ) {
             out.ubo.push(text);
         }
     }
@@ -2750,25 +2754,45 @@ const runPages = async function() {
             const d = browser.contentDocument;
             return d && d.readyState === 'complete' && d.documentURI.startsWith(`${base}${path}`) ? d : null;
         }, 30000, path);
-        const dashboardReady = browser => waitFor(( ) => {
+        const dashboardReady = (browser, oldDoc = null) => waitFor(( ) => {
             const d = browser.contentDocument;
-            return d && d.documentURI.startsWith(`${base}dashboard.html`) && d.body &&
+            return d && d !== oldDoc && d.documentURI.startsWith(`${base}dashboard.html`) && d.body &&
                 d.readyState === 'complete' && d.body.classList.contains('notReady') === false ? d : null;
         }, 60000, 'the dashboard ready');
 
-        // runtime.reload(): the dashboard stays, reloaded, and works.
+        // runtime.reload() as a dashboard pane has just started loading:
+        // the dashboard stays, is reloaded, and works; the pane cut short
+        // logs nothing.
         const dashTab = win.gBrowser.addTab(`${base}dashboard.html`);
         const oldDoc = await dashboardReady(dashTab.linkedBrowser);
+        await sleep(1000);
+        const paneURL = `${base}1p-filters.html`;
+        const paneCreated = new Promise(resolve => {
+            const observer = {
+                observe(doc) {
+                    if ( doc.documentURI !== paneURL ) { return; }
+                    Services.obs.removeObserver(observer, 'document-element-inserted');
+                    resolve(doc);
+                },
+            };
+            Services.obs.addObserver(observer, 'document-element-inserted', false);
+        });
+        oldDoc.defaultView.location.hash = '#1p-filters.html';
+        const paneDoc = await paneCreated;
+        let paneAtStop = '';
+        ext.onShutdown(( ) => { paneAtStop = paneDoc.readyState; });
         const reloadAt = Date.now();
         callBackground(bgWindow, 'runtime.reload');
         await waitFor(( ) => extension !== null && extension !== ext, 30000, 'the new runtime');
         await whenUBOReady();
-        const newDoc = await dashboardReady(dashTab.linkedBrowser).catch(( ) => null);
+        const newDoc = await dashboardReady(dashTab.linkedBrowser, oldDoc).catch(( ) => null);
         await sleep(2000);
+        const newPane = newDoc && newDoc.getElementById('iframe').contentDocument;
         report.reload = {
+            paneAtStop,
             tabOpen: dashTab.parentNode !== null,
-            reloaded: newDoc !== null && newDoc !== oldDoc,
-            ready: newDoc !== null,
+            reloaded: newDoc !== null,
+            pane: newPane ? `${newPane.documentURI.replace(base, '')} ${newPane.readyState}` : null,
             errors: errorsSince(reloadAt),
         };
 
@@ -2823,8 +2847,10 @@ const runPages = async function() {
     const windowKept = Array.isArray(disable.soloWindow) && disable.soloWindow.length === 1 &&
         disable.soloWindow[0].startsWith('moz-extension:') === false;
     const checks = {
+        reloadCutsPaneShort: pass(reload.paneAtStop === 'loading' || reload.paneAtStop === 'interactive',
+            reload.paneAtStop),
         reloadKeepsTab: pass(reload.tabOpen === true, reload.tabOpen),
-        reloadReloads: pass(reload.reloaded === true && reload.ready === true, reload),
+        reloadReloads: pass(reload.reloaded === true && reload.pane === '1p-filters.html complete', reload),
         reloadNoErrors: pass(noErrors(reload.errors), reload.errors),
         disableClosesTabs: pass(tabsClosed, [ disable.dashTabGone, disable.mainWindowOwnTabs ]),
         disableKeepsWindow: pass(windowKept, disable.soloWindow),
@@ -2838,6 +2864,129 @@ const runPages = async function() {
         checks,
         reload,
         disable,
+        error: report.error,
+    };
+    return report;
+};
+
+/******************************************************************************/
+
+// uBO's dashboard controls which took their event from `window.event`, a
+// global UXP lacks: the Filter lists pane's two settings (the change threw,
+// the setting never saved), and the dashboard holding back a page with
+// unsaved My filters edits (its beforeunload handler threw: the page went
+// without asking). The page is asked as the browser asks before closing a
+// tab (nsIContentViewer.permitUnload()), its prompt answered by the test.
+const runDashboard = async function() {
+    const report = {};
+    const startedAt = Date.now();
+    let tab = null;
+    try {
+        // A page may ask only after the user used it, where the browser has
+        // that rule; the test's edits are no user's.
+        Services.prefs.setBoolPref('dom.require_user_interaction_for_beforeunload', false);
+        const { ext, µb } = await whenUBOReady();
+        const base = ext.getURL('');
+        const win = Services.wm.getMostRecentWindow('navigator:browser');
+        tab = win.gBrowser.addTab(`${base}dashboard.html#3p-filters.html`);
+        win.gBrowser.selectedTab = tab;
+        const browser = tab.linkedBrowser;
+        const paneOf = path => waitFor(( ) => {
+            const frame = browser.contentDocument.getElementById('iframe');
+            const pane = frame && frame.contentDocument;
+            return pane && pane.documentURI === `${base}${path}` && pane.readyState === 'complete' ? pane : null;
+        }, 30000, path);
+        const top = await dashboardReady(browser);
+        let pane = await paneOf('3p-filters.html');
+        await sleep(1000);
+        report.settings = {};
+        for ( const id of [ 'autoUpdate', 'suspendUntilListsAreLoaded' ] ) {
+            const before = µb.userSettings[id] === true;
+            const settled = value => waitFor(( ) => µb.userSettings[id] === value, 5000, id)
+                .then(( ) => true, ( ) => false);
+            const input = pane.getElementById(id);
+            input.click();
+            const changed = await settled(!before);
+            input.click();
+            const restored = await settled(before);
+            report.settings[id] = { before, changed, restored };
+        }
+
+        top.defaultView.location.hash = '#1p-filters.html';
+        pane = await paneOf('1p-filters.html');
+        const editor = await waitFor(( ) => {
+            const node = pane.querySelector('.CodeMirror');
+            return node && Cu.waiveXrays(node).CodeMirror;
+        }, 10000, 'the My filters editor');
+        await sleep(500);
+        const viewer = browser.docShell.contentViewer;
+        const paneWindow = Cu.waiveXrays(pane.defaultView);
+        // The browser's "leave page?" prompt runs a nested event loop, where
+        // a timer finds it and answers "Stay on page" (button 1).
+        const ask = ( ) => {
+            const state = {
+                paneSaysUnsaved: paneWindow.hasUnsavedData() === true,
+                prompted: '',
+            };
+            const deadline = Date.now() + 10000;
+            let timer;
+            const answer = ( ) => {
+                for ( const prompt of win.gBrowser.getTabModalPromptBox(browser).listPrompts() ) {
+                    state.prompted = 'tab-modal';
+                    prompt.onButtonClick(1);
+                    return;
+                }
+                const windows = Services.wm.getEnumerator(null);
+                while ( windows.hasMoreElements() ) {
+                    const dialog = windows.getNext();
+                    if ( dialog.location.href !== 'chrome://global/content/commonDialog.xul' ) { continue; }
+                    state.prompted = 'window-modal';
+                    dialog.document.documentElement.cancelDialog();
+                    return;
+                }
+                if ( Date.now() < deadline ) { timer = setTimeout(answer, 100); }
+            };
+            timer = setTimeout(answer, 100);
+            try {
+                state.leaveAllowed = viewer.permitUnload();
+            } finally {
+                clearTimeout(timer);
+            }
+            return state;
+        };
+        const saved = editor.getValue();
+        editor.setValue(`${saved}\n||uxp-unsaved.test^`);
+        await sleep(300);
+        report.unsaved = ask();
+        editor.setValue(saved);
+        await sleep(300);
+        report.saved = ask();
+    } catch (ex) {
+        report.error = String(ex);
+    }
+    if ( tab !== null && tab.parentNode !== null ) {
+        tab.ownerGlobal.gBrowser.removeTab(tab);
+    }
+    report.errors = errorsSince(startedAt);
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    const { settings = {}, unsaved = {}, saved = {}, errors } = report;
+    const saves = id => settings[id] !== undefined &&
+        settings[id].changed === true && settings[id].restored === true;
+    const checks = {
+        autoUpdateSaves: pass(saves('autoUpdate'), settings.autoUpdate),
+        suspendSaves: pass(saves('suspendUntilListsAreLoaded'), settings.suspendUntilListsAreLoaded),
+        unsavedAsks: pass(unsaved.paneSaysUnsaved === true && unsaved.prompted !== '' &&
+            unsaved.leaveAllowed === false, unsaved),
+        savedLeaves: pass(saved.paneSaysUnsaved === false && saved.prompted === '' &&
+            saved.leaveAllowed === true, saved),
+        noErrors: pass(errors.runtime.length === 0 && errors.ubo.length === 0, errors),
+    };
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks,
+        settings,
+        unsaved,
+        saved,
         error: report.error,
     };
     return report;
@@ -3492,6 +3641,7 @@ const scenarios = {
     update: runUpdate,
     'stop-busy': runStopBusy,
     pages: runPages,
+    dashboard: runDashboard,
     upgrade: runUpgrade,
     stalls: runStalls,
     compile: runCompile,

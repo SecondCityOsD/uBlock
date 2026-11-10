@@ -1373,18 +1373,13 @@ const getSupportData = async function() {
         removedListset = undefined;
     }
 
-    let browserFamily = (( ) => {
-        if ( vAPI.webextFlavor.soup.has('firefox') ) { return 'Firefox'; }
-        if ( vAPI.webextFlavor.soup.has('chromium') ) { return 'Chromium'; }
-        return 'Unknown';
-    })();
-    if ( vAPI.webextFlavor.soup.has('mobile') ) {
-        browserFamily += ' Mobile';
-    }
+    // [uBlock-UXP] The user agent's Firefox/<major> is only the engine's
+    // compatibility claim: name the real browser and its version.
+    const browserInfo = await browser.runtime.getBrowserInfo();
 
     return {
         [`${vAPI.app.name}`]: `${vAPI.app.version}`,
-        [`${browserFamily}`]: `${vAPI.webextFlavor.major}`,
+        [`${browserInfo.name}`]: `${browserInfo.version}`,
         'filterset (summary)': {
             network: staticNetFilteringEngine.getFilterCount(),
             cosmetic: cosmeticFilteringEngine.getFilterCount(),

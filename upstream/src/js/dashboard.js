@@ -151,10 +151,13 @@ if ( self.location.hash.slice(1) === 'no-dashboard.html' ) {
         dom.on('.tabButton', 'click', onTabClickHandler);
 
         // https://developer.mozilla.org/en-US/docs/Web/API/Window/beforeunload_event
-        dom.on(self, 'beforeunload', ( ) => {
+        // [uBlock-UXP] The event from the handler's argument: UXP has no
+        // global `window.event`, the handler threw and the page closed with
+        // its unsaved changes, without asking.
+        dom.on(self, 'beforeunload', ev => {
             if ( discardUnsavedData(true) ) { return; }
-            event.preventDefault();
-            event.returnValue = '';
+            ev.preventDefault();
+            ev.returnValue = '';
         });
 
         // https://developer.mozilla.org/en-US/docs/Web/API/Window/beforeunload_event

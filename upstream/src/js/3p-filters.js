@@ -653,8 +653,10 @@ dom.on('#buttonUpdate', 'click', ( ) => { buttonUpdateHandler(); });
 
 /******************************************************************************/
 
-const userSettingCheckboxChanged = ( ) => {
-    const target = event.target;
+// [uBlock-UXP] The event from the handler's argument: UXP has no global
+// `window.event`, the change threw and the setting was never saved.
+const userSettingCheckboxChanged = ev => {
+    const target = ev.target;
     vAPI.messaging.send('dashboard', {
         what: 'userSettings',
         name: target.id,

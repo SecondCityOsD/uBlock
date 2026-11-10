@@ -754,7 +754,8 @@ var Extension = class {
     // undoing what they have to (observers, requests held, the toolbar
     // button, the browser's settings). `closePages`: the extension goes
     // away (a disable, an uninstall), see closePages(); otherwise its pages
-    // stay for the next runtime (see reloadOrphanPages()).
+    // stay for the next runtime, still (see stopPages(),
+    // reloadOrphanPages()).
     shutdown(closePages = false) {
         if ( this.shutdownStarted ) { return; }
         this.shutdownStarted = true;
@@ -784,6 +785,19 @@ var Extension = class {
         this.shutdownCallbacks = [];
         if ( closePages ) {
             step(( ) => { this.closePages(); });
+        } else {
+            step(( ) => { this.stopPages(); });
+        }
+    }
+
+    // The extension's pages kept for the next runtime have no API any more:
+    // one still loading (a dashboard pane opened a moment before) would run
+    // the rest of its scripts against it and fail on what it no longer
+    // answers. Their loads stop here, their frames' too, until the next
+    // runtime reloads them. Firefox closes them instead.
+    stopPages() {
+        for ( const { tab } of Array.from(this.ownTabs()) ) {
+            tab.linkedBrowser.stop();
         }
     }
 

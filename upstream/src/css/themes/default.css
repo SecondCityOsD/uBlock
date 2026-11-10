@@ -385,6 +385,46 @@
     color-scheme: dark light;
 }
 
+/* [uBlock-UXP] UXP has no `color-scheme`: the rule above leaves the
+   browser's own form controls light in the dark theme. These rules draw
+   them in the theme's colors. They match with no weight, as browser
+   defaults would, so a pane's own rule for a field still wins. Gecko stops
+   drawing a styled control natively, so the drop-down arrow is drawn here.
+   The spin buttons of number fields can't be styled at all on UXP: they're
+   hidden, the value still steps with the arrow keys. */
+:where(:root.dark) :where(input:not([type="checkbox"]):not([type="color"]):not([type="file"]):not([type="radio"]):not([type="range"]), select, textarea) {
+    background-color: var(--surface-1);
+    border: 1px solid var(--border-2);
+    color: var(--ink-1);
+}
+:where(:root.dark) input[type="number"] {
+    appearance: textfield;
+}
+:where(:root.dark) :where(input, select, textarea):focus {
+    border-color: var(--accent-surface-1);
+}
+:where(:root.dark) :where(input, select, textarea):disabled {
+    filter: var(--button-disabled-filter);
+}
+:where(:root.dark) input[type="color"] {
+    background-color: var(--button-surface);
+    border: 1px solid var(--border-2);
+}
+/* Outweighs common.css's `select { padding }`, loaded after this file. */
+:root.dark select {
+    appearance: none;
+    background-image:
+        linear-gradient(45deg, transparent 50%, currentColor 50%),
+        linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position: right 11px center, right 6px center;
+    background-repeat: no-repeat;
+    background-size: 5px 5px;
+    padding-inline-end: 20px;
+}
+:root.dark body[dir="rtl"] select {
+    background-position: left 6px center, left 11px center;
+}
+
 /*
  * Shared declarations
  * */
