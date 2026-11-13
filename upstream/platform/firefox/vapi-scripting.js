@@ -322,7 +322,11 @@ function onCommitted(details) {
     const entry = contentScriptDict.get(hostname) ??
         prepareContentScript(url, tabId, frameId);
     if ( entry.registered !== true ) {
-        manuallyInject(tabId, frameId, entry);
+        // [uBlock-UXP] No injection by hand: on UXP, contentScripts.register()
+        // takes effect at once, and onCommitted comes before the committed
+        // document gets its root element, so the registered scripts reach it
+        // at document_start. Injected by hand too, every scriptlet ran twice
+        // in it (manuallyInject() is left for upstream merges).
         registerContentScript(entry);
     }
     entry.t = Date.now();

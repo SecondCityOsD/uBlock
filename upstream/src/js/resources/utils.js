@@ -388,15 +388,31 @@ export function lookupElementsFn(directive, until = 0) {
             }
             return out;
         };
+        // [uBlock-UXP] Where there is no Element.checkVisibility() (UXP),
+        // what it checks with these options: the element has a box (it
+        // and its ancestors are rendered), its `visibility` is `visible`,
+        // and neither it nor an ancestor has an opacity of 0.
+        lookupElementsFn.isVisible = elem => {
+            if ( typeof elem.checkVisibility === 'function' ) {
+                return elem.checkVisibility({
+                    opacityProperty: true,
+                    visibilityProperty: true,
+                });
+            }
+            if ( elem.getClientRects().length === 0 ) { return false; }
+            const view = elem.ownerDocument.defaultView;
+            if ( view.getComputedStyle(elem).visibility !== 'visible' ) { return false; }
+            for ( let e = elem; e; e = e.parentElement || e.parentNode && e.parentNode.host ) {
+                if ( view.getComputedStyle(e).opacity === '0' ) { return false; }
+            }
+            return true;
+        };
         lookupElementsFn.lookup = directive => {
             const beVisible = directive.startsWith('when-visible:');
             const selector = beVisible ? directive.slice(13) : directive;
             const elems = lookupElementsFn.querySelectorEx(selector);
             if ( beVisible !== true ) { return elems; }
-            return elems.filter(a => a.checkVisibility({
-                opacityProperty: true,
-                visibilityProperty: true,
-            }));
+            return elems.filter(a => lookupElementsFn.isVisible(a));
         };
         lookupElementsFn.lookupAsync = details => {
             const elems = lookupElementsFn.lookup(details.directive);

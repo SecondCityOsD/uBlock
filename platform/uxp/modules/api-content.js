@@ -36,8 +36,9 @@
 //
 // Loaded into Extension.jsm's global (see there).
 
-/* global Ci, Cu, Services, URL, dispatch, MatchPattern, windowUtilsOf,
-          Context, ExtensionError, PageValue, apiSync, apiAsync, injectAPI */
+/* global Cc, Ci, Cu, Services, NetUtil, URL, NAME_PREFIX, dispatch,
+          MatchPattern, windowUtilsOf, Context, ExtensionError, PageValue,
+          apiSync, apiAsync, injectAPI */
 /* exported createContentAPIs */
 
 'use strict';
@@ -215,6 +216,105 @@ const Sources = class {
 
 /******************************************************************************/
 
+// MAIN-world scripts run in the page's own global, as in Firefox, whatever
+// the page's CSP. UXP gives chrome code one way there (no evalInWindow, no
+// compileScript): the subscript loader, which compiles a script in its
+// target's global, but loads local URLs only -- not data: nor blob:. So
+// each script's text is written once to a temporary folder, which a chrome
+// package of its own maps: the page sees chrome://<package>/content/<n>.js
+// in stack traces, not a local path nor this add-on's name, and pages
+// cannot load chrome: URLs. A file lasts while a content script holds it.
+// Its first read starts as it is written, off the main thread: a file's
+// first open costs ~50 ms per 100 KB on Windows (antivirus scanning), its
+// next ones ~6 ms, as much as compiling the code in an inline <script>.
+
+const writeTextFile = function(file, text) {
+    const stream = Cc['@mozilla.org/network/file-output-stream;1']
+        .createInstance(Ci.nsIFileOutputStream);
+    // PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE
+    stream.init(file, 0x02 | 0x08 | 0x20, 0o600, 0);
+    const converter = Cc['@mozilla.org/intl/converter-output-stream;1']
+        .createInstance(Ci.nsIConverterOutputStream);
+    converter.init(stream, 'UTF-8', 0, 0);
+    try {
+        converter.writeString(text);
+    } finally {
+        converter.close();
+    }
+};
+
+const PageScripts = class {
+    constructor() {
+        this.dir = null;
+        this.package = '';
+        // By text: { text, file, url, holders }
+        this.entries = new Map();
+        this.count = 0;
+    }
+
+    // The folder and its package, made when first needed.
+    open() {
+        if ( this.dir !== null ) { return this.dir; }
+        const dir = Services.dirsvc.get('TmpD', Ci.nsIFile);
+        dir.append(`${NAME_PREFIX}-page-scripts`);
+        dir.createUnique(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+        const manifest = dir.clone();
+        manifest.append('chrome.manifest');
+        this.package = `p${Math.random().toString(36).slice(2, 12)}`;
+        writeTextFile(manifest, `content ${this.package} ./\n`);
+        Components.manager.addBootstrappedManifestLocation(dir);
+        this.dir = dir;
+        return dir;
+    }
+
+    // The file holding `text`, shared by all who hold it.
+    acquire(text) {
+        let entry = this.entries.get(text);
+        if ( entry === undefined ) {
+            const file = this.open().clone();
+            const name = `${++this.count}.js`;
+            file.append(name);
+            writeTextFile(file, text);
+            entry = { text, file, url: `chrome://${this.package}/content/${name}`, holders: 0 };
+            this.entries.set(text, entry);
+            NetUtil.asyncFetch({ uri: entry.url, loadUsingSystemPrincipal: true }, stream => {
+                try {
+                    stream.close();
+                } catch {
+                }
+            });
+        }
+        entry.holders += 1;
+        return entry;
+    }
+
+    release(entry) {
+        entry.holders -= 1;
+        if ( entry.holders !== 0 || this.entries.get(entry.text) !== entry ) { return; }
+        this.entries.delete(entry.text);
+        try {
+            entry.file.remove(false);
+        } catch {
+            // Still open for its first read: it goes with the folder.
+        }
+    }
+
+    stop() {
+        const { dir } = this;
+        if ( dir === null ) { return; }
+        this.dir = null;
+        this.entries.clear();
+        try {
+            Components.manager.removeBootstrappedManifestLocation(dir);
+            dir.remove(true);
+        } catch (ex) {
+            Cu.reportError(ex);
+        }
+    }
+};
+
+/******************************************************************************/
+
 // A content script: a manifest entry, or one registered at runtime.
 
 const ContentScript = class {
@@ -234,6 +334,9 @@ const ContentScript = class {
         this.matchOriginAsFallback = details.matchOriginAsFallback === true;
         this.runAt = checkRunAt(details.runAt);
         this.world = checkWorld(details.world);
+        // A MAIN-world script's files, while it is registered (see
+        // ContentScripts.register()): one PageScripts entry per source.
+        this.pageFiles = null;
     }
 
     appliesTo(urls, isTop) {
@@ -285,9 +388,6 @@ const ContentContext = class extends Context {
         });
         super(extension, window, 'content_script', sandbox);
         this.sandbox = sandbox;
-        // MAIN-world scripts where the page's CSP rules out an inline
-        // <script>, made when first needed (see evaluateInPage()).
-        this.mainSandbox = null;
         this.document = doc;
         this.sheets = [];
         this.waiting = [];
@@ -305,47 +405,15 @@ const ContentContext = class extends Context {
         return Cu.evalInSandbox(text, this.sandbox, 'latest', filename, 1);
     }
 
-    // A script of the MAIN world, in the page's own global (Firefox runs
-    // those there whatever the page's CSP; UXP gives chrome code no way to,
-    // no evalInWindow nor compileScript, and the subscript loader takes
-    // local URLs only). An inline <script> runs it there exactly as the
-    // page's own code: the page's builtins, `globalThis` the window. Where
-    // that can't run (a page with a CSP, which may forbid inline scripts and
-    // would report the attempt; a document not HTML), a sandbox of the
-    // page's principal without Xrays: the page's window and DOM, but the
-    // sandbox's own builtins and `globalThis`.
-    evaluateInPage(text, filename) {
-        const doc = this.document;
-        let csp = null;
-        try {
-            csp = doc.nodePrincipal.csp;
-        } catch {
-        }
-        if ( csp === null && doc.documentElement !== null ) {
-            const page = Cu.waiveXrays(this.window);
-            const sentinel = `uxp-main-world-${Math.random().toString(36).slice(2)}`;
-            const script = doc.createElementNS('http://www.w3.org/1999/xhtml', 'script');
-            script.textContent = `window[${JSON.stringify(sentinel)}] = true;\n${text}`;
-            (doc.head || doc.documentElement).appendChild(script);
-            script.remove();
-            if ( page[sentinel] === true ) {
-                delete page[sentinel];
-                return;
-            }
-        }
-        if ( this.mainSandbox === null ) {
-            this.mainSandbox = Cu.Sandbox(this.window, {
-                sandboxName: `${this.extension.id} content script (page)`,
-                metadata: {
-                    'inner-window-id': this.innerWindowID,
-                    addonId: this.extension.id,
-                },
-                sandboxPrototype: this.window,
-                sameZoneAs: this.window,
-                wantXrays: false,
-            });
-        }
-        Cu.evalInSandbox(text, this.mainSandbox, 'latest', filename, 1);
+    // A script of the MAIN world, from its file (see PageScripts): in the
+    // page's own global, exactly as the page's own code -- the page's
+    // builtins, `globalThis` the window -- leaving nothing in its DOM.
+    evaluateInPage(url) {
+        Services.scriptloader.loadSubScriptWithOptions(url, {
+            target: this.window,
+            charset: 'UTF-8',
+            ignoreCache: true,
+        });
     }
 
     reached(runAt) {
@@ -440,10 +508,6 @@ const ContentContext = class extends Context {
             }
         }
         Cu.nukeSandbox(sandbox);
-        if ( this.mainSandbox !== null ) {
-            Cu.nukeSandbox(this.mainSandbox);
-            this.mainSandbox = null;
-        }
     }
 };
 
@@ -470,6 +534,7 @@ const ContentScripts = class {
             }, root)
         );
         this.registered = new Set();
+        this.pageScripts = new PageScripts();
         this.observer = {
             observe: (subject, topic) => { this.observe(subject, topic); },
         };
@@ -486,6 +551,7 @@ const ContentScripts = class {
             Services.obs.removeObserver(this.observer, topic);
         }
         this.registered.clear();
+        this.pageScripts.stop();
     }
 
     observe(subject, topic) {
@@ -570,14 +636,18 @@ const ContentScripts = class {
                     Cu.reportError(ex);
                 }
             }
-            for ( const source of script.js ) {
+            for ( let i = 0; i < script.js.length; i++ ) {
                 if ( context.unloaded ) { return; }
                 try {
-                    const text = this.sources.textOf(source);
                     if ( script.world === 'MAIN' ) {
-                        context.evaluateInPage(text, source.url);
+                        // Its file is gone if it was unregistered since.
+                        const entry = script.pageFiles[i];
+                        if ( entry.holders !== 0 ) {
+                            context.evaluateInPage(entry.url);
+                        }
                     } else {
-                        context.evaluate(text, source.url);
+                        const source = script.js[i];
+                        context.evaluate(this.sources.textOf(source), source.url);
                     }
                 } catch (ex) {
                     Cu.reportError(ex);
@@ -782,9 +852,19 @@ const ContentScripts = class {
             throw new ExtensionError('Missing content script options');
         }
         const script = new ContentScript(this.sources, options, context.url);
+        // Written now, so that pages need not wait for them.
+        if ( script.world === 'MAIN' ) {
+            script.pageFiles = script.js.map(source =>
+                this.pageScripts.acquire(this.sources.textOf(source))
+            );
+        }
         this.registered.add(script);
         const unregister = ( ) => {
-            this.registered.delete(script);
+            if ( this.registered.delete(script) && script.pageFiles !== null ) {
+                for ( const entry of script.pageFiles ) {
+                    this.pageScripts.release(entry);
+                }
+            }
             context.forgetOnUnload(unregister);
         };
         context.callOnUnload(unregister);

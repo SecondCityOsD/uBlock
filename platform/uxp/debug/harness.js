@@ -1092,9 +1092,17 @@ const runNetwork = async function() {
 
 // Cosmetic: uBO's specific, generic and procedural cosmetic filters hide
 // their targets in a page, its subframe and its about:blank frames, despite
-// the page's own `!important` styles (user-origin CSS); its scriptlet runs
-// before the page's first script; the content-script APIs behave as in
-// Firefox.
+// the page's own `!important` styles (user-origin CSS); its scriptlets run
+// before the page's first script, in the page's own global, whatever its
+// CSP; the content-script APIs behave as in Firefox.
+//
+// The scriptlets are of the kinds YouTube's filters use, each hooking
+// something of the page's own: a value set on the window, then one nested
+// in it (`set, ytInitialPlayerResponse.adPlacements, undefined`), JSON.parse
+// (`json-prune`) and fetch() (`json-prune-fetch-response`). Run anywhere but
+// in the page's own global, the last three change nothing for the page.
+// They run once per document, on the first visit to the site too: the
+// timer booster (`nano-stb`, any delay) stacks, so a timer's delay tells.
 //
 // Served from a name resolving to the loopback server (Gecko's
 // network.dns.localDomains): EasyList turns generic cosmetic filtering off on
@@ -1107,18 +1115,50 @@ const COSMETIC_FILTERS = [
     '##.uxp-generic-ad',
     `${COSMETIC_HOST}##.uxp-proc:has-text(sponsored)`,
     `${COSMETIC_HOST}##+js(set-constant, uxpScriptletValue, true)`,
+    `${COSMETIC_HOST}##+js(set, uxpPlayer.adPlacements, undefined)`,
+    `${COSMETIC_HOST}##+js(json-prune, uxpAdPlacements)`,
+    `${COSMETIC_HOST}##+js(json-prune-fetch-response, uxpAdPlacements, , propsToMatch, /uxp-player)`,
+    `${COSMETIC_HOST}##+js(nano-stb, uxpTimer, *, 0.25)`,
+    // A trusted scriptlet (user filters are trusted in this scenario): its
+    // `when-visible:` lookup waits for the button's reveal.
+    `${COSMETIC_HOST}##+js(trusted-click-element, when-visible:#uxpButton)`,
 ];
 
+// What each document's first script sees of the scriptlets. A 2000 ms
+// timer, boosted by 1/4 per run of the scriptlets, fires after 500 ms if
+// they ran once, 125 ms if twice (a busy machine only delays timers): one
+// set by that first script, another once the document has loaded, which
+// a late second run would boost too.
+const SCRIPTLET_RECORDER = `{
+const results = document.documentElement.dataset;
+results.scriptlet = String(window.uxpScriptletValue);
+window.uxpPlayer = { adPlacements: [ 1 ], videoDetails: {} };
+results.nested = String(window.uxpPlayer.adPlacements);
+results.jsonParse = JSON.stringify(JSON.parse('{"uxpAdPlacements":[1],"ok":1}'));
+fetch('/uxp-player').then(r => r.text()).then(
+    text => { results.fetch = text; },
+    error => { results.fetch = String(error); }
+);
+const timeRuns = key => {
+    const start = performance.now();
+    setTimeout(function uxpTimer() {
+        const ms = performance.now() - start;
+        results[key] = ms < 300 ? 'twice' : ms < 1200 ? 'once' : 'not at all';
+    }, 2000);
+};
+timeRuns('runs');
+window.addEventListener('load', ( ) => { timeRuns('runsAfterLoad'); });
+}`;
+
 const cosmeticRoutes = function(path) {
-    // Every document records what its first script sees of the scriptlet.
     // With a nonce, the document has a CSP allowing only scripts with it:
-    // the scriptlet's MAIN world can't be an inline <script> there.
+    // no inline <script> without it, no eval().
     const html = (title, body, nonce = '') => ({
         type: 'text/html; charset=utf-8',
         headers: nonce !== '' ? [ `Content-Security-Policy: script-src 'nonce-${nonce}'` ] : [],
         body: `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
 <style>.uxp-ad, .uxp-generic-ad, .uxp-proc, .uxp-ok { display: block !important; }</style>
-<script${nonce !== '' ? ` nonce="${nonce}"` : ''}>document.documentElement.dataset.scriptlet = String(window.uxpScriptletValue);</script>
+<script${nonce !== '' ? ` nonce="${nonce}"` : ''}>${SCRIPTLET_RECORDER}</script>
 </head><body>${body}</body></html>`,
     });
     const ad = '<div id="specific" class="uxp-ad">ad</div>';
@@ -1133,7 +1173,20 @@ ${ad}
 <iframe id="cspFrame" src="/cosmetic-csp-frame.html"></iframe>
 <iframe id="blankWritten"></iframe>
 <iframe id="blankDOM"></iframe>
+<button id="uxpButton" style="visibility: hidden">button</button>
 <script>
+// Revealed half a second in: a click before that came too early.
+{
+    const button = document.getElementById('uxpButton');
+    let revealed = false;
+    button.addEventListener('click', ( ) => {
+        document.documentElement.dataset.click = revealed ? 'once visible' : 'while hidden';
+    });
+    setTimeout(( ) => {
+        revealed = true;
+        button.style.visibility = 'visible';
+    }, 500);
+}
 {
     const doc = document.getElementById('blankWritten').contentDocument;
     doc.open();
@@ -1152,9 +1205,21 @@ ${ad}
         return html('uxp-cosmetic-frame', `<div id="ok" class="uxp-ok">ok</div>${ad}`);
     case '/cosmetic-csp-frame.html':
         return html('uxp-cosmetic-csp-frame', '<div id="ok" class="uxp-ok">ok</div>', 'uxp');
+    case '/uxp-player':
+        return { type: 'application/json', body: '{"uxpAdPlacements":[1],"ok":1}' };
     default:
         return null;
     }
+};
+
+// As SCRIPTLET_RECORDER records it, with the scriptlets at work.
+const SCRIPTLETS_EXPECTED = {
+    scriptlet: 'true',
+    nested: 'undefined',
+    jsonParse: '{"ok":1}',
+    fetch: '{"ok":1}',
+    runs: 'once',
+    runsAfterLoad: 'once',
 };
 
 const COSMETIC_EXPECTED = {
@@ -1164,10 +1229,11 @@ const COSMETIC_EXPECTED = {
         generic: 'hidden',
         procedural: 'hidden',
         proceduralOther: 'shown',
-        scriptlet: 'true',
+        ...SCRIPTLETS_EXPECTED,
+        click: 'once visible',
     },
-    frame: { ok: 'shown', specific: 'hidden', scriptlet: 'true' },
-    cspFrame: { scriptlet: 'true' },
+    frame: { ok: 'shown', specific: 'hidden', ...SCRIPTLETS_EXPECTED },
+    cspFrame: { ...SCRIPTLETS_EXPECTED },
     aboutBlankWritten: { specific: 'hidden' },
     aboutBlankDOM: { specific: 'hidden' },
 };
@@ -1178,12 +1244,17 @@ const cosmeticState = function(doc) {
         if ( !el ) { return 'missing'; }
         return d.defaultView.getComputedStyle(el).display === 'none' ? 'hidden' : 'shown';
     };
+    const scriptlets = d => {
+        const results = d && d.documentElement ? d.documentElement.dataset : {};
+        return Object.fromEntries(Object.keys(SCRIPTLETS_EXPECTED).map(key =>
+            [ key, results[key] === undefined ? 'missing' : results[key] ]
+        ));
+    };
     const frameDoc = id => {
         const frame = doc.getElementById(id);
         return frame ? frame.contentDocument : null;
     };
     const frame = frameDoc('frame');
-    const cspFrame = frameDoc('cspFrame');
     return {
         page: {
             ok: display(doc, 'ok'),
@@ -1191,20 +1262,15 @@ const cosmeticState = function(doc) {
             generic: display(doc, 'generic'),
             procedural: display(doc, 'procedural'),
             proceduralOther: display(doc, 'procOk'),
-            scriptlet: doc.documentElement.dataset.scriptlet,
+            ...scriptlets(doc),
+            click: doc.documentElement.dataset.click || 'missing',
         },
         frame: {
             ok: display(frame, 'ok'),
             specific: display(frame, 'specific'),
-            scriptlet: frame && frame.documentElement
-                ? frame.documentElement.dataset.scriptlet
-                : 'missing',
+            ...scriptlets(frame),
         },
-        cspFrame: {
-            scriptlet: cspFrame && cspFrame.documentElement
-                ? cspFrame.documentElement.dataset.scriptlet
-                : 'missing',
-        },
+        cspFrame: scriptlets(frameDoc('cspFrame')),
         aboutBlankWritten: { specific: display(frameDoc('blankWritten'), 'specific') },
         aboutBlankDOM: { specific: display(frameDoc('blankDOM'), 'specific') },
     };
@@ -3953,6 +4019,8 @@ const SCENARIO_FILTERS = {
     stalls: STOP_FILTERS,
 };
 const SCENARIO_USER_SETTINGS = {
+    // Its filters include a trusted scriptlet.
+    cosmetic: [ [ 'userFiltersTrusted', 'true' ] ],
     filtering: FILTERING_USER_SETTINGS,
     // Its own update phase only: uBO's updater would overlap the others.
     stalls: [ [ 'autoUpdate', 'false' ] ],

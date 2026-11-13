@@ -1064,10 +1064,15 @@ function jsonEditFetchResponseFn(trusted, jsonq = '', ...varargs) {
                 const objAfter = jsonp.apply(obj);
                 if ( objAfter === undefined ) { return responseBefore; }
                 safe.uboLog(logPrefix, 'Edited');
-                const responseAfter = Response.json(objAfter, {
+                // [uBlock-UXP] What Response.json() makes, which UXP lacks.
+                const headers = new Headers(responseBefore.headers);
+                if ( headers.has('content-type') === false ) {
+                    headers.set('content-type', 'application/json');
+                }
+                const responseAfter = new Response(safe.JSON_stringify(objAfter), {
                     status: responseBefore.status,
                     statusText: responseBefore.statusText,
-                    headers: responseBefore.headers,
+                    headers,
                 });
                 Object.defineProperties(responseAfter, {
                     ok: { value: responseBefore.ok },
