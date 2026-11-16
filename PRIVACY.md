@@ -15,7 +15,7 @@ accounts.
   server your IP address.
 - **Its own updates.** Your browser checks this repository's update
   manifest
-  (`https://raw.githubusercontent.com/SecondCityOsD/uBlock/main/update.rdf`)
+  (`https://raw.githubusercontent.com/SecondCityOsD/uBlock/master/update.rdf`)
   and downloads new versions from its GitHub releases. The request carries
   nothing about you or your settings.
 

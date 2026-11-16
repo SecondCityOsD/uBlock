@@ -92,7 +92,7 @@ const AUTHOR = 'SinfulOsD';
 // release branch, each XPI is an asset of the GitHub release tagged with its
 // em:version.
 const REPOSITORY = 'SecondCityOsD/uBlock';
-const RELEASE_BRANCH = 'main';
+const RELEASE_BRANCH = 'master';
 const HOMEPAGE_URL = `https://github.com/${REPOSITORY}`;
 const UPDATE_URL = `https://raw.githubusercontent.com/${REPOSITORY}/${RELEASE_BRANCH}/update.rdf`;
 const releaseAssetURL = (emVersion, file) =>
