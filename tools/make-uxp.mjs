@@ -62,7 +62,7 @@ import zlib from 'node:zlib';
 // (0 for a new upstream version). manifest.json keeps the plain upstream
 // version: uBO treats any version not matching \d+.\d+.\d+ exactly as a dev
 // build (vapi-common.js), which changes its behavior.
-const UXP_REVISION = 0;
+const UXP_REVISION = 1;
 
 // Not legacy uBO's `ublock0`: both may be registered at once. bootstrap.js
 // loads the runtime from it.
