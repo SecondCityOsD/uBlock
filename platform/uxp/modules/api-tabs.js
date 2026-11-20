@@ -147,6 +147,9 @@ const TabTracker = class {
         this.selectedTabIds = new WeakMap();
         this.openerPending = new WeakSet();
         this.locations = new WeakMap();
+        // Tabs whose global history is off while they show the extension's
+        // pages (see keepOutOfHistory()).
+        this.historyOff = new WeakSet();
         this.focusedWindowId = WINDOW_ID_NONE;
         const events = (namespace, names) => Object.fromEntries(
             names.map(name => [ name, new EventManager(`${namespace}.${name}`) ])
@@ -226,6 +229,9 @@ const TabTracker = class {
         }
         for ( const win of Array.from(this.windows) ) {
             this.detachWindow(win);
+        }
+        for ( const browser of this.browsers.values() ) {
+            this.keepOutOfHistory(browser, '');
         }
         this.browsers.clear();
     }
@@ -681,6 +687,31 @@ const TabTracker = class {
         return { transitionType, transitionQualifiers };
     }
 
+    // The extension's pages stay out of the browser's history: UXP's keeps
+    // out its own chrome: and about: pages, but recorded moz-extension: ones
+    // like websites, two visits for each dashboard pane opened. A tab which
+    // starts loading one stops adding to the global history (its frames and
+    // its same-document navigations too) until it loads something else, or
+    // the extension stops (url ''). A tab whose history is off already, for
+    // another reason, is left as it is.
+    keepOutOfHistory(browser, url) {
+        let docShell = null;
+        try {
+            docShell = browser.docShell;
+        } catch {
+        }
+        if ( !docShell ) { return; }
+        const own = url !== '' && this.extension.isOwnURL(url);
+        if ( own ) {
+            if ( this.historyOff.has(browser) || docShell.useGlobalHistory === false ) { return; }
+            docShell.useGlobalHistory = false;
+            this.historyOff.add(browser);
+        } else if ( this.historyOff.has(browser) ) {
+            docShell.useGlobalHistory = true;
+            this.historyOff.delete(browser);
+        }
+    }
+
     onStateChange(webProgress, request, flags, status) {
         const isStart = (flags & wpl.STATE_START) !== 0;
         const isStop = (flags & wpl.STATE_STOP) !== 0;
@@ -688,6 +719,9 @@ const TabTracker = class {
             const url = requestURLOf(request);
             const nav = this.navigationDetails(webProgress, url);
             if ( nav === null ) { return; }
+            if ( nav.details.frameId === 0 ) {
+                this.keepOutOfHistory(nav.browser, url);
+            }
             this.navigationEvents.onBeforeNavigate.fire(nav.details);
             if ( nav.details.frameId === 0 ) {
                 this.checkOpener(nav.browser, url);
