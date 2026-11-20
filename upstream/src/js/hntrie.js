@@ -644,7 +644,14 @@ class HNTrieContainer {
             roundToPageSize(char1 + charGrow),
             this.buf.length
         );
-        this.resizeBuf(bufLen, char0);
+        // [uBlock-UXP] By half its size at least, as filterDataGrow() in
+        // static-net-filtering.js; shrinkBuf() trims it once built.
+        this.resizeBuf(
+            bufLen > this.buf.length
+                ? Math.max(bufLen, this.buf.length + (this.buf.length >>> 1))
+                : bufLen,
+            char0
+        );
     }
 
     shrinkBuf() {

@@ -832,8 +832,10 @@ class BidiTrieContainer {
             roundToPageSize(char1 + charGrow),
             this.buf8.length
         );
+        // [uBlock-UXP] By half its size at least, as filterDataGrow() in
+        // static-net-filtering.js; shrinkBuf() trims it once built.
         if ( bufLen > this.buf8.length ) {
-            this.reallocateBuf(bufLen);
+            this.reallocateBuf(Math.max(bufLen, this.buf8.length + (this.buf8.length >>> 1)));
         }
         if ( char0 !== this.buf32[CHAR0_SLOT] ) {
             this.buf8.copyWithin(

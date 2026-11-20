@@ -492,7 +492,13 @@ let filterData = new Int32Array(FILTER_DATA_PAGE_SIZE * 5);
 let filterDataWritePtr = 2;
 const filterDataGrow = len => {
     if ( len <= filterData.length ) { return; }
-    const newLen = roundToFilterDataPageSize(len);
+    // [uBlock-UXP] By half its size at least: grown a page at a time, the
+    // buffer was reallocated and copied hundreds of times while the engine
+    // was built, and the discarded copies piled up to hundreds of MB before
+    // a garbage collection. filterDataShrink() trims it once built.
+    const newLen = roundToFilterDataPageSize(
+        Math.max(len, filterData.length + (filterData.length >>> 1))
+    );
     const newBuf = new Int32Array(newLen);
     newBuf.set(filterData);
     filterData = newBuf;
