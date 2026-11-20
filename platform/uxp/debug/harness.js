@@ -3917,6 +3917,76 @@ const runCompile = async function() {
 
 /******************************************************************************/
 
+// Reset: the Settings pane's "Reset to default settings" (its confirm()
+// answered): uBO clears its data and restarts the extension, which comes
+// back with the default settings, its lists compiled and stored again. The
+// cache storage's IndexedDB is emptied, not deleted: deleting it took UXP's
+// quota usage below zero, where it wraps, every write failed as over quota
+// and the browser crashed.
+
+const RESET_SETTINGS = [ 'tooltipsDisabled', 'colorBlindFriendly', 'advancedUserEnabled' ];
+
+const quotaUsageOf = principal => new Promise(resolve => {
+    const qms = Cc['@mozilla.org/dom/quota-manager-service;1']
+        .getService(Ci.nsIQuotaManagerService);
+    qms.getUsageForPrincipal(principal, {
+        onUsageResult: request => { resolve((request.result || request).usage); },
+    }, true);
+});
+
+const runReset = async function() {
+    const report = {};
+    let failure = null;
+    try {
+        prefs.setCharPref('scenario', '');
+        prefs.setBoolPref('keepConsoleLog', true);
+        const { ext, bgWindow } = await whenUBOReady();
+        const ubo = Cu.waiveXrays(bgWindow).µBlock;
+        for ( const name of RESET_SETTINGS ) { ubo.changeUserSettings(name, true); }
+        report.usageBefore = await quotaUsageOf(bgWindow.document.nodePrincipal);
+        const page = await openTab(ext.getURL('dashboard.html#settings.html'));
+        const first = consoleLines.length;
+        Cu.waiveXrays(page.doc.defaultView).vAPI.messaging.send('dashboard', { what: 'resetUserData' });
+        await waitFor(( ) => extension !== null && extension !== ext, 30000, 'the restarted runtime');
+        const after = await whenUBOReady();
+        // The lists the restarted uBO compiled, stored in the worker.
+        await sleep(3000);
+        report.settings = Object.fromEntries(RESET_SETTINGS.map(name =>
+            [ name, after.µb.userSettings[name] ]
+        ));
+        report.usageAfter = await quotaUsageOf(after.bgWindow.document.nodePrincipal);
+        const lines = consoleLines.slice(first);
+        report.quotaErrors = lines.filter(l => l.text.includes('QuotaExceeded')).length;
+        report.stored = lines.filter(l => /idbStorage\(\) cache\/compiled\/\S+ written/.test(l.text)).length;
+        report.notStored = lines.filter(l => /idbStorage\(\) \S+ not written/.test(l.text))
+            .map(l => l.text.slice(0, 120));
+        report.ownErrors = ownErrors(lines);
+        page.close();
+    } catch (ex) {
+        failure = String(ex);
+    }
+    const pass = (ok, value) => ok ? 'PASS' : `FAIL: ${JSON.stringify(value)}`;
+    report.summary = {
+        app: `${Services.appinfo.name} ${Services.appinfo.version}`,
+        checks: {
+            defaults: pass(report.settings !== undefined &&
+                Object.values(report.settings).every(v => v === false), report.settings),
+            // A wrapped usage is near 2^64.
+            usageSane: pass(report.usageAfter < 1e12, report.usageAfter),
+            noQuotaErrors: pass(report.quotaErrors === 0, report.quotaErrors),
+            storedAgain: pass(report.stored !== 0 && (report.notStored || []).length === 0, report.notStored),
+            noErrors: pass(report.ownErrors !== undefined && report.ownErrors.length === 0, report.ownErrors),
+        },
+        usage: `${report.usageBefore} bytes before, ${report.usageAfter} after`,
+    };
+    if ( failure !== null ) {
+        report.summary.error = failure;
+    }
+    return report;
+};
+
+/******************************************************************************/
+
 const whenBrowserReady = async function() {
     const deadline = Date.now() + 60000;
     while ( Date.now() < deadline ) {
@@ -4004,6 +4074,7 @@ const scenarios = {
     upgrade: runUpgrade,
     stalls: runStalls,
     compile: runCompile,
+    reset: runReset,
 };
 
 // Filters and user settings given to uBO through managed storage.

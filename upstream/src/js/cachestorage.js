@@ -240,9 +240,13 @@ const cacheStorage = (( ) => {
             });
         },
 
+        // [uBlock-UXP] Settled once both are cleared: uBO's reset restarts
+        // the extension right after (see idbStorage.clear()).
         clear(...args) {
-            cacheAPIs[fastCache].clear(...args);
-            return extensionStorage.clear(...args).catch(reason => {
+            return Promise.all([
+                cacheAPIs[fastCache].clear(...args),
+                extensionStorage.clear(...args),
+            ]).catch(reason => {
                 ubolog(reason);
             });
         },
@@ -809,11 +813,25 @@ const idbStorage = (( ) => {
         },
 
         clear() {
-            // [uBlock-UXP] Once the worker's writes ended.
+            // [uBlock-UXP] The database emptied, not deleted, once the
+            // worker's writes ended. UXP's quota manager counts a database
+            // short (by ~0.8 MB on 12 MB): deleting it took the origin's
+            // usage below zero, where it wraps around, and every write after
+            // it failed as over quota; the browser then crashed (uBO's
+            // "Reset to default settings"). Clearing the entries frees what
+            // was counted, as replacing them does.
             return Promise.all(workerWrites.values()).then(( ) => getDb()).then(db => {
                 if ( db === null ) { return; }
-                db.close();
-                indexedDB.deleteDatabase(STORAGE_NAME);
+                return new Promise(resolve => {
+                    const transaction = db.transaction(STORAGE_NAME, 'readwrite');
+                    transaction.oncomplete = ( ) => { resolve(); };
+                    transaction.onerror =
+                    transaction.onabort = ( ) => {
+                        ubolog(`idbStorage.clear() failed: ${transaction.error}`);
+                        resolve();
+                    };
+                    transaction.objectStore(STORAGE_NAME).clear();
+                });
             }).catch(reason => {
                 ubolog(`idbStorage.clear() failed: ${reason}`);
             });
