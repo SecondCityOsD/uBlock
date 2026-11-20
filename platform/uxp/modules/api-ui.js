@@ -388,6 +388,24 @@ PopupView.EVENTS = [ 'DOMWindowClose', 'DOMContentLoaded', 'load', 'MozScrolledA
 /******************************************************************************/
 
 // Pale Moon: a palette toolbar button, and an arrow panel for the popup.
+//
+// Its Customize Toolbar dialog is a window of its own, whose palette shows
+// copies of the palette's buttons: ours keeps its icon properties (set on
+// the element, see BrowserAction.renderWindow()), but the browser window's
+// style sheet is not there to apply them, and Pale Moon's toolbar image
+// strip showed whole instead. The dialog gets a sheet of its own.
+
+const CUSTOMIZE_DIALOG_URL = 'chrome://global/content/customizeToolbar.xul';
+
+const customizeDialogStyleOf = id => `
+#${id} {
+    list-style-image: var(${cssProperty('icon')}) !important;
+    -moz-image-region: auto !important;
+}
+#${id} .toolbarbutton-icon {
+    width: 16px;
+    height: 16px;
+}`;
 
 const PaleMoonButton = class {
     constructor(action) {
@@ -396,12 +414,38 @@ const PaleMoonButton = class {
         this.panelId = `${this.id}-panel`;
         this.buttons = new WeakMap();
         this.views = new WeakMap();
+        this.dialogStyleURI = `data:text/css;charset=utf-8,${
+            encodeURIComponent(customizeDialogStyleOf(this.id))
+        }`;
+        // Open Customize Toolbar dialogs, which have the sheet.
+        this.dialogs = new Set();
     }
 
     start() {
+        Services.ww.registerNotification(this);
     }
 
     stop() {
+        Services.ww.unregisterNotification(this);
+        for ( const dialog of this.dialogs ) {
+            try {
+                windowUtilsOf(dialog).removeSheetUsingURIString(this.dialogStyleURI, AUTHOR_SHEET);
+            } catch {
+            }
+        }
+        this.dialogs.clear();
+    }
+
+    // A window opened: a Customize Toolbar dialog gets the sheet once its
+    // document is there, before its palette is built (at its load).
+    observe(win, topic) {
+        if ( topic !== 'domwindowopened' ) { return; }
+        win.addEventListener('DOMContentLoaded', ( ) => {
+            if ( win.location.href !== CUSTOMIZE_DIALOG_URL ) { return; }
+            windowUtilsOf(win).loadSheetUsingURIString(this.dialogStyleURI, AUTHOR_SHEET);
+            this.dialogs.add(win);
+            win.addEventListener('unload', ( ) => { this.dialogs.delete(win); }, { once: true });
+        }, { once: true });
     }
 
     attachWindow(win) {

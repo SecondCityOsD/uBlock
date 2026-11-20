@@ -1492,7 +1492,8 @@ const runCosmetic = async function() {
 // button and closed by the popup itself; the context menu (uBO's items,
 // "Block element" starting the element picker); a keyboard shortcut set
 // through commands.update(); the Options button in about:addons and
-// runtime.openOptionsPage(), each opening uBO's dashboard in a tab.
+// runtime.openOptionsPage(), each opening uBO's dashboard in a tab; on Pale
+// Moon, the button in the Customize Toolbar dialog's palette, then back.
 // Screenshots of the toolbar and the popup go next to the report.
 
 const UI_FILTERS = [ '||127.0.0.1^*/uxp-blocked/' ];
@@ -1763,6 +1764,39 @@ const runUI = async function() {
             options.fromAPI = await dashboardOpened();
             closeDashboards();
         });
+
+        // Pale Moon's Customize Toolbar dialog (a window of its own) with
+        // the button in the palette: uBO's icon there, at its toolbar size;
+        // back on the navigation bar, the button opens the popup.
+        await section('customize', async ( ) => {
+            if ( Services.appinfo.name !== 'Pale Moon' ) { return; }
+            const id = 'ublock-uxp-button';
+            const navbar = win.document.getElementById('nav-bar');
+            const currentSet = navbar.currentSet;
+            navbar.currentSet = currentSet.split(',').filter(item => item !== id).join(',');
+            win.BrowserCustomizeToolbar();
+            const dialog = await waitFor(( ) => {
+                const w = Services.wm.getMostRecentWindow(null);
+                return w && w.location.href === 'chrome://global/content/customizeToolbar.xul' &&
+                    w.document.readyState === 'complete' && w.document.getElementById(id) ? w : null;
+            }, 10000, 'the Customize Toolbar dialog');
+            const copy = dialog.document.getElementById(id);
+            const icon = dialog.document.getAnonymousElementByAttribute(copy, 'class', 'toolbarbutton-icon');
+            const customize = report.customize = {
+                image: dialog.getComputedStyle(copy).listStyleImage,
+                iconSize: icon ? `${icon.getBoundingClientRect().width}x${icon.getBoundingClientRect().height}` : 'none',
+            };
+            dialog.close();
+            await waitFor(( ) => dialog.closed, 5000, 'the dialog closed');
+            navbar.currentSet = currentSet;
+            const button = win.document.getElementById(id);
+            customize.backOnNavbar = button !== null && button.parentNode === navbar;
+            button.doCommand();
+            customize.popupOpens = await waitFor(( ) => findPopupBrowser(win), 8000, 'the popup')
+                .then(( ) => true, ( ) => false);
+            win.document.getElementById(`${id}-panel`).hidePopup();
+            await waitFor(( ) => findPopupBrowser(win) === null, 5000, 'the popup to go').catch(( ) => null);
+        });
         page.close();
     } catch (ex) {
         failure = String(ex);
@@ -1787,9 +1821,15 @@ const runUI = async function() {
     checks.optionsButton = pass(options.fromAddonsManager === true, options.fromAddonsManager);
     checks.openOptionsPage = pass(options.openOptionsPage && options.openOptionsPage.error === undefined &&
         options.fromAPI === true, [ options.openOptionsPage, options.fromAPI ]);
+    if ( Services.appinfo.name === 'Pale Moon' ) {
+        const { customize } = report;
+        checks.customizeDialog = pass(customize && /^url\("moz-extension:/.test(customize.image) &&
+            customize.iconSize === '16x16' && customize.backOnNavbar && customize.popupOpens, customize);
+    }
     report.summary = {
         app: `${Services.appinfo.name} ${Services.appinfo.version}`,
         checks,
+        customize: report.customize,
         button: report.button,
         popup: report.popup,
         options: report.options,
