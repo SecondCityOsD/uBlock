@@ -62,7 +62,7 @@ import zlib from 'node:zlib';
 // (0 for a new upstream version). manifest.json keeps the plain upstream
 // version: uBO treats any version not matching \d+.\d+.\d+ exactly as a dev
 // build (vapi-common.js), which changes its behavior.
-const UXP_REVISION = 1;
+const UXP_REVISION = 0;
 
 // Not legacy uBO's `ublock0`: both may be registered at once. bootstrap.js
 // loads the runtime from it.
@@ -130,7 +130,7 @@ const ASSETS_CACHE = path.join(DIST, 'uAssets-cache');
 // imported over this commit, on a branch of its own (upstream/ replaced by
 // `git -c core.autocrlf=false archive` of the release's tag, without its
 // submodules), merged, and becomes the new PRISTINE_COMMIT.
-const PRISTINE_COMMIT = 'c18511d5299cfcf1b7ad081a10e2550a87dec873';
+const PRISTINE_COMMIT = '3308faf2a31f6abb4e10a9829363d28e9d7ee4ca';
 const CHANGE_MARK = '[uBlock-UXP]';
 
 /******************************************************************************/
