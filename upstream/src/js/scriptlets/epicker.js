@@ -29,7 +29,11 @@ if ( vAPI === null ) { return; }
 if ( vAPI.pickerFrame ) { return; }
 vAPI.pickerFrame = true;
 
-const pickerUniqueId = self.crypto.randomUUID().replaceAll('-', '').slice(16);
+// [uBlock-UXP] Starts with a letter: it names an attribute of the picker's
+// frame, and UXP's DOM throws InvalidCharacterError for an attribute name
+// starting with a digit, as a UUID's hex digits often do -- then the picker
+// never showed (newer engines accept such names).
+const pickerUniqueId = `u${self.crypto.randomUUID().replaceAll('-', '').slice(17)}`;
 
 const reCosmeticAnchor = /^#(\$|\?|\$\?)?#/;
 

@@ -1670,14 +1670,45 @@ const runUI = async function() {
                 onElement.items[0].doCommand();
             }
             onElement.menu.hidePopup();
-            const frameURLs = ( ) => Array.from(page.doc.querySelectorAll('iframe'),
-                f => f.contentDocument ? f.contentDocument.documentURI : 'no document'
-            );
+            // The page's frames from its docshell tree: since 1.77, the
+            // picker's frame is in a closed shadow root, out of the page's
+            // querySelectorAll() reach.
+            const pageFrames = ( ) => {
+                const out = [];
+                const shells = page.tab.linkedBrowser.docShell.getDocShellEnumerator(
+                    Ci.nsIDocShellTreeItem.typeAll,
+                    Ci.nsIDocShell.ENUMERATE_FORWARDS
+                );
+                while ( shells.hasMoreElements() ) {
+                    const shell = shells.getNext().QueryInterface(Ci.nsIDocShell);
+                    const doc = shell.contentViewer && shell.contentViewer.DOMDocument;
+                    if ( doc === null || doc === page.doc ) { continue; }
+                    out.push(doc);
+                }
+                return out;
+            };
+            const pickerDoc = ( ) => pageFrames().find(d => d.documentURI.includes('/epicker-ui.html'));
             report.pickerStarted = await waitFor(
-                ( ) => frameURLs().some(url => url.includes('/epicker-ui.html')),
+                ( ) => pickerDoc() !== undefined,
                 10000, 'the element picker'
             ).catch(( ) => false);
-            report.pageFrames = frameURLs();
+            report.pageFrames = pageFrames().map(d => d.documentURI);
+            // Over the whole page once loaded: uBO's sheet styles the frame
+            // from outside its shadow root.
+            const frame = report.pickerStarted ? pickerDoc().defaultView.frameElement : null;
+            if ( frame !== null ) {
+                await waitFor(( ) => frame.hasAttribute('loaded'), 5000, 'the picker shown').catch(( ) => false);
+                const style = page.doc.defaultView.getComputedStyle(frame);
+                const rect = frame.getBoundingClientRect();
+                report.pickerFrame = {
+                    position: style.position,
+                    visibility: style.visibility,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    viewport: [ page.doc.documentElement.clientWidth, page.doc.documentElement.clientHeight ],
+                    inShadowRoot: frame.parentNode !== null && frame.parentNode.nodeType === 11,
+                };
+            }
         });
 
         // Keyboard shortcut
@@ -1812,6 +1843,12 @@ const runUI = async function() {
     checks.menuOnSubscribeLink = pass((report.menuOnSubscribeLink || []).length === 2, report.menuOnSubscribeLink);
     checks.menuOnElement = pass((report.menuOnElement || []).length === 1, report.menuOnElement);
     checks.pickerStarted = pass(report.pickerStarted === true, report.pickerStarted);
+    const pf = report.pickerFrame;
+    checks.pickerCoversPage = pass(
+        pf !== undefined && pf.position === 'fixed' && pf.visibility === 'visible' &&
+            pf.width >= pf.viewport[0] && pf.height >= pf.viewport[1],
+        pf
+    );
     checks.commands = pass(Array.isArray(report.commands) && report.commands.length === 8, report.commands);
     checks.shortcut = pass(report.shortcutKey === 'alt,shift L' && report.loggerOpened, [ report.shortcutKey, report.loggerOpened ]);
     checks.shortcutReset = pass(report.shortcutAfterReset === 'none', report.shortcutAfterReset);
