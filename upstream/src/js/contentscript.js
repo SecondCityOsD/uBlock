@@ -102,7 +102,13 @@
 //   https://github.com/gorhill/uBlock/issues/2029
 
 // >>>>>>>> start of HUGE-IF-BLOCK
-if ( typeof vAPI === 'object' ) {
+// [uBlock-UXP] Once per document. uBO injects its content scripts into the
+// tabs open when it launches (start.js); on UXP, a page which started loading
+// while uBO was launching got them from the manifest already, and this file
+// would run twice in it (vapi.js and vapi-client.js keep the first vAPI).
+if ( typeof vAPI === 'object' && vAPI.contentScript !== true ) {
+
+vAPI.contentScript = true;
 
 /******************************************************************************/
 /******************************************************************************/
